@@ -153,28 +153,34 @@ jobs:
           RELEASE_URL: ${{ steps.fetch.outputs.url }}
           RELEASE_BODY: ${{ steps.fetch.outputs.body }}
         run: |
-          set -euo pipefail
-          release_title="$RELEASE_NAME"
-          if [ -z "$release_title" ]; then
-            release_title="$RELEASE_TAG"
-          fi
+          python - <<'PY'
+import json
+import os
 
-          text="External release \\`$RELEASE_TAG\\` detected for *$TARGET_REPO*\n"
-          text="${text}Title: $release_title\n"
-          text="${text}URL: $RELEASE_URL"
+target_repo = os.environ['TARGET_REPO']
+release_tag = os.environ.get('RELEASE_TAG', 'unknown')
+release_name = os.environ.get('RELEASE_NAME') or release_tag
+release_url = os.environ.get('RELEASE_URL', '')
+release_body = os.environ.get('RELEASE_BODY') or ''
 
-          trimmed=$(printf '%s' "$RELEASE_BODY" | tr -d '[:space:]')
-          if [ -n "$trimmed" ]; then
-            text="${text}\n\n\\`\\`\\`markdown\n$RELEASE_BODY\n\\`\\`\\`"
-          fi
+lines = [
+    f"External release `{release_tag}` detected for *{target_repo}*",
+    f"Title: {release_name}",
+    f"URL: {release_url}",
+]
 
-          payload=$(jq -n --arg text "$text" '{text: $text}')
+if release_body.strip():
+    lines.append('\n```markdown')
+    lines.append(release_body)
+    lines.append('```')
 
-          {
-            echo "payload<<EOF"
-            printf '%s\n' "$payload"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+payload = json.dumps({"text": '\n'.join(lines)})
+
+with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+    fh.write('payload<<EOF\n')
+    fh.write(payload)
+    fh.write('\nEOF\n')
+PY
 
       - name: Mattermostへ送信
         if: steps.compare.outputs.changed == 'true'

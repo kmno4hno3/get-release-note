@@ -17,11 +17,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$TARGET_REPO" ]; then
-            echo "Vars.TARGET_REPOSITORY が未設定です。" >&2
+            echo "Vars.TARGET_REPOSITORY が未設定です" >&2
             exit 1
           fi
           if [ -z "$MATTERMOST_WEBHOOK_URL" ]; then
-            echo "Secrets.MATTERMOST_WEBHOOK_URL が未設定です。" >&2
+            echo "Secrets.MATTERMOST_WEBHOOK_URL が未設定です" >&2
             exit 1
           fi
 
@@ -64,7 +64,6 @@ jobs:
             printf 'tag=%s\n' "$tag"
             printf 'name=%s\n' "$name"
             printf 'url=%s\n' "$url"
-            # bodyは複数行の可能性があるのでEOF形式で出力
             printf 'body<<EOF\n%s\nEOF\n' "$body"
           } >> "$GITHUB_OUTPUT"
 
@@ -124,34 +123,27 @@ jobs:
           RELEASE_URL: ${{ steps.fetch.outputs.url }}
           RELEASE_BODY: ${{ steps.fetch.outputs.body }}
         run: |
-          python - <<'PY'
-import json
-import os
+          set -euo pipefail
+          release_title="$RELEASE_NAME"
+          if [ -z "$release_title" ]; then
+            release_title="$RELEASE_TAG"
+          fi
 
-repo = os.environ['TARGET_REPO']
-tag = os.environ.get('RELEASE_TAG', 'unknown')
-name = os.environ.get('RELEASE_NAME') or tag
-url = os.environ.get('RELEASE_URL', '')
-body = os.environ.get('RELEASE_BODY') or ''
+          text="External release \\`$RELEASE_TAG\\` detected for *$TARGET_REPO*\n"
+          text+="Title: $release_title\n"
+          text+="URL: $RELEASE_URL"
 
-lines = [
-    f"External release `{tag}` detected for *{repo}*",
-    f"Title: {name}",
-    f"URL: {url}",
-]
+          if [[ -n "${RELEASE_BODY//[[:space:]]/}" ]]; then
+            text+="\n\n\\`\\`\\`markdown\n$RELEASE_BODY\n\\`\\`\\`"
+          fi
 
-if body.strip():
-    lines.append('\n```markdown')
-    lines.append(body)
-    lines.append('```')
+          payload=$(jq -n --arg text "$text" '{text: $text}')
 
-payload = json.dumps({"text": '\n'.join(lines)})
-
-with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
-    f.write('payload<<EOF\n')
-    f.write(payload)
-    f.write('\nEOF\n')
-PY
+          {
+            echo "payload<<EOF"
+            printf '%s\n' "$payload"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Mattermostへ送信
         if: steps.compare.outputs.changed == 'true'

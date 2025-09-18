@@ -1,0 +1,189 @@
+name: Monitor External Release
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+env:
+  TARGET_REPO: ${{ vars.TARGET_REPOSITORY }}
+  MATTERMOST_WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+
+jobs:
+  watch-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 設定検証
+        run: |
+          set -euo pipefail
+          if [ -z "$TARGET_REPO" ]; then
+            echo "Vars.TARGET_REPOSITORY が未設定です" >&2
+            exit 1
+          fi
+          if [ -z "$MATTERMOST_WEBHOOK_URL" ]; then
+            echo "Secrets.MATTERMOST_WEBHOOK_URL が未設定です" >&2
+            exit 1
+          fi
+
+      - name: 最新リリース取得
+        id: fetch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tmp_json=$(mktemp)
+          status=$(curl -sS -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -o "$tmp_json" \
+            "https://api.github.com/repos/${TARGET_REPO}/releases/latest")
+
+          if [ "$status" -eq 404 ]; then
+            echo "release_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$status" -ne 200 ]; then
+            echo "GitHub API error: HTTP $status" >&2
+            cat "$tmp_json" >&2 || true
+            exit 1
+          fi
+
+          tag=$(jq -r '.tag_name // empty' "$tmp_json")
+          if [ -z "$tag" ]; then
+            echo "release_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          name=$(jq -r '.name // empty' "$tmp_json")
+          url=$(jq -r '.html_url // empty' "$tmp_json")
+          body=$(jq -r '.body // empty' "$tmp_json")
+
+          {
+            echo "release_found=true"
+            printf 'tag=%s\n' "$tag"
+            printf 'name=%s\n' "$name"
+            printf 'url=%s\n' "$url"
+            # bodyは複数行の可能性があるのでEOF形式で出力
+            printf 'body<<EOF\n%s\nEOF\n' "$body"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 前回通知済みタグ取得
+        if: steps.fetch.outputs.release_found == 'true'
+        id: previous
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tmp_json=$(mktemp)
+          status=$(curl -sS -w '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -o "$tmp_json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/LAST_SEEN_RELEASE")
+
+          if [ "$status" -eq 404 ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "last_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$status" -ne 200 ]; then
+            echo "GitHub API error: HTTP $status" >&2
+            cat "$tmp_json" >&2 || true
+            exit 1
+          fi
+
+          last=$(jq -r '.value // empty' "$tmp_json")
+          {
+            echo "exists=true"
+            printf 'last_tag=%s\n' "$last"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 新規リリース判定
+        if: steps.fetch.outputs.release_found == 'true'
+        id: compare
+        env:
+          LATEST_TAG: ${{ steps.fetch.outputs.tag }}
+          LAST_TAG: ${{ steps.previous.outputs.last_tag }}
+        run: |
+          set -euo pipefail
+          if [ "$LATEST_TAG" = "$LAST_TAG" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mattermostメッセージ生成
+        if: steps.compare.outputs.changed == 'true'
+        id: message
+        env:
+          TARGET_REPO: ${{ env.TARGET_REPO }}
+          RELEASE_TAG: ${{ steps.fetch.outputs.tag }}
+          RELEASE_NAME: ${{ steps.fetch.outputs.name }}
+          RELEASE_URL: ${{ steps.fetch.outputs.url }}
+          RELEASE_BODY: ${{ steps.fetch.outputs.body }}
+        run: |
+          python - <<'PY'
+import json
+import os
+
+repo = os.environ['TARGET_REPO']
+tag = os.environ.get('RELEASE_TAG', 'unknown')
+name = os.environ.get('RELEASE_NAME') or tag
+url = os.environ.get('RELEASE_URL', '')
+body = os.environ.get('RELEASE_BODY') or ''
+
+lines = [
+    f"External release `{tag}` detected for *{repo}*",
+    f"Title: {name}",
+    f"URL: {url}",
+]
+
+if body.strip():
+    lines.append('\n```markdown')
+    lines.append(body)
+    lines.append('```')
+
+payload = json.dumps({"text": '\n'.join(lines)})
+
+with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+    f.write('payload<<EOF\n')
+    f.write(payload)
+    f.write('\nEOF\n')
+PY
+
+      - name: Mattermostへ送信
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          curl -sS -X POST \
+            -H 'Content-Type: application/json' \
+            -d '${{ steps.message.outputs.payload }}' \
+            "$MATTERMOST_WEBHOOK_URL"
+
+      - name: 最終通知タグ更新
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST_TAG: ${{ steps.fetch.outputs.tag }}
+          VARIABLE_EXISTS: ${{ steps.previous.outputs.exists }}
+        run: |
+          set -euo pipefail
+          data=$(jq -n --arg value "$LATEST_TAG" '{name:"LAST_SEEN_RELEASE", value:$value}')
+          url="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables"
+
+          if [ "$VARIABLE_EXISTS" = "true" ]; then
+            curl -sS -X PATCH \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -d "$data" \
+              "$url/LAST_SEEN_RELEASE" >/dev/null
+          else
+            curl -sS -X POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -d "$data" \
+              "$url" >/dev/null
+          fi

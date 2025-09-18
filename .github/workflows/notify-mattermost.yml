@@ -17,11 +17,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$TARGET_REPO" ]; then
-            echo "Vars.TARGET_REPOSITORY が未設定です" >&2
+            echo "Vars.TARGET_REPOSITORY が未設定です。" >&2
             exit 1
           fi
           if [ -z "$MATTERMOST_WEBHOOK_URL" ]; then
-            echo "Secrets.MATTERMOST_WEBHOOK_URL が未設定です" >&2
+            echo "Secrets.MATTERMOST_WEBHOOK_URL が未設定です。" >&2
             exit 1
           fi
 

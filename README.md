@@ -1,6 +1,6 @@
 # 外部リポジトリのリリース監視通知
 
-このリポジトリの GitHub Actions ワークフローは、指定した外部 GitHub リポジトリの最新リリースを定期的にポーリングし、新しいリリースを検出した場合に Mattermost へ通知します。通知済みのタグはリポジトリ内の専用 Issue に記録し、重複通知を防ぎます。
+このリポジトリの GitHub Actions ワークフローは、指定した外部 GitHub リポジトリの最新リリースを定期的にポーリングし、新しいリリースを検出した場合に Mattermost へ通知します。通知済みのタグはワークフローアーティファクトとして保存するため、Issue や追加トークンは不要です。
 
 ## 前提条件
 
@@ -22,18 +22,18 @@
   - `workflow_dispatch` による手動実行
 - フロー:
   1. GitHub API (`releases/latest`) から最新リリースを取得
-  2. リポジトリ内の Issue（ラベル: `release-monitor`）に保存された前回通知タグと比較
+  2. ワークフローアーティファクトの `state.json` から前回通知済みタグを読込
   3. 新しいタグであれば Mattermost へ整形済みメッセージを投稿
-  4. Issue の本文に最新タグ JSON (`{"last_tag":"..."}`) を保存
+  4. 通知後（または変更がない場合でも）最新タグを含む `state.json` を再生成し、`release-monitor-state` という名前でアーティファクトへ保存
 
 ## 初回実行の確認方法
 
 1. `Actions` タブから `Monitor External Release` ワークフローを開きます。
-2. `Run workflow` で手動実行し、成功後に Mattermost へ通知が届くことと、リポジトリ Issue に「External Release Monitor State」が作成されていることを確認します。
-   - Issue の本文に現在通知済みのタグが JSON で保存されます。
+2. `Run workflow` で手動実行し、成功後に Mattermost へ通知が届くことを確認します。
+3. `Actions` タブで該当ジョブを開き、Artifacts に `release-monitor-state` が生成されていることを確認します。アーティファクト内の `state.json` に通知済みタグが保存されます。
 
 ## カスタマイズ
 
 - ポーリング頻度を変更する場合は、ワークフロー内 `schedule` セクションの cron 式を調整してください。
-- 通知文面を変更したい場合は、`Mattermostメッセージ生成` ステップの文字列整形部分を編集します。
-- Issue 名やラベル名を変更する場合は、ワークフロー内の該当文字列を同じ値で置き換えてください。
+- 通知文面を変更したい場合は、`Mattermostメッセージ生成` ステップの Python スクリプトを編集します。
+- Mattermost の投稿先チャンネルを個別指定したい場合は、ペイロードに `"channel": "チャンネル名"` を追加してください（Webhook 設定で許可されている場合のみ有効）。

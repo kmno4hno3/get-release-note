@@ -87,17 +87,17 @@ jobs:
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100")
 
-          encoded=$(printf '%s\n' "$response" | jq -r --arg name "$ARTIFACT_NAME" \
-            '[.artifacts[] | select(.name == $name and .expired == false)] | sort_by(.created_at) | last | @base64')
+          download_url=$(printf '%s\n' "$response" | jq -r --arg name "$ARTIFACT_NAME" \
+            '[.artifacts[] | select(.name == $name and .expired == false)] | sort_by(.created_at) | last | .archive_download_url')
 
-          if [ -z "$encoded" ] || [ "$encoded" = "null" ]; then
+          artifact_id=$(printf '%s\n' "$response" | jq -r --arg name "$ARTIFACT_NAME" \
+            '[.artifacts[] | select(.name == $name and .expired == false)] | sort_by(.created_at) | last | .id')
+
+          if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
             echo "last_tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          artifact_id=$(printf '%s' "$encoded" | base64 --decode | jq -r '.id')
-          download_url=$(printf '%s' "$encoded" | base64 --decode | jq -r '.archive_download_url')
 
           curl -sS -L \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
@@ -113,10 +113,12 @@ jobs:
           printf 'artifact_id=%s\n' "$artifact_id" >> "$GITHUB_OUTPUT"
           printf 'last_tag=%s\n' "$last_tag" >> "$GITHUB_OUTPUT"
 
-          curl -sS -X DELETE \
-            -H 'Accept: application/vnd.github+json' \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" >/dev/null
+          if [ -n "$artifact_id" ] && [ "$artifact_id" != "null" ]; then
+            curl -sS -X DELETE \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" >/dev/null
+          fi
 
       - name: 新規リリース判定
         if: steps.fetch.outputs.release_found == 'true'

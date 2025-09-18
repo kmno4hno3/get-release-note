@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: read
-  actions: write
+  issues: write
 
 env:
   TARGET_REPO: ${{ vars.TARGET_REPOSITORY }}
@@ -38,6 +38,7 @@ jobs:
           tmp_json=$(mktemp)
           status=$(curl -sS -w '%{http_code}' \
             -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
             -o "$tmp_json" \
             "https://api.github.com/repos/${TARGET_REPO}/releases/latest")
 
@@ -70,35 +71,62 @@ jobs:
             printf 'body<<EOF\n%s\nEOF\n' "$body"
           } >> "$GITHUB_OUTPUT"
 
-      - name: 前回通知済みタグ取得
+      - name: 状態読み込み・初期化
         if: steps.fetch.outputs.release_found == 'true'
-        id: previous
+        id: state
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          tmp_json=$(mktemp)
+          label="release-monitor"
+          tmp=$(mktemp)
           status=$(curl -sS -w '%{http_code}' \
             -H 'Accept: application/vnd.github+json' \
-            -o "$tmp_json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables/LAST_SEEN_RELEASE")
-
-          if [ "$status" -eq 404 ]; then
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "last_tag=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -o "$tmp" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues?labels=${label}&state=open&per_page=1")
 
           if [ "$status" -ne 200 ]; then
             echo "GitHub API error: HTTP $status" >&2
-            cat "$tmp_json" >&2 || true
+            cat "$tmp" >&2 || true
             exit 1
           fi
 
-          last=$(jq -r '.value // empty' "$tmp_json")
+          issue_number=$(jq -r '.[0].number // empty' "$tmp")
+          issue_body=$(jq -r '.[0].body // empty' "$tmp")
+
+          if [ -z "$issue_number" ]; then
+            state_json='{"last_tag":""}'
+            create_payload=$(jq -n \
+              --arg title "External Release Monitor State" \
+              --arg body "$state_json" \
+              --arg label "$label" \
+              '{title:$title, body:$body, labels:[$label]}')
+
+            tmp_create=$(mktemp)
+            status=$(curl -sS -w '%{http_code}' \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -o "$tmp_create" \
+              -d "$create_payload" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues")
+
+            if [ "$status" -ne 201 ]; then
+              echo "GitHub API error: HTTP $status" >&2
+              cat "$tmp_create" >&2 || true
+              exit 1
+            fi
+
+            issue_number=$(jq -r '.number' "$tmp_create")
+            issue_body=$(jq -r '.body // empty' "$tmp_create")
+          fi
+
+          last_tag=$(printf '%s' "$issue_body" | jq -r 'try fromjson catch {} | .last_tag // ""')
+
           {
-            echo "exists=true"
-            printf 'last_tag=%s\n' "$last"
+            printf 'issue_number=%s\n' "$issue_number"
+            printf 'last_tag=%s\n' "$last_tag"
           } >> "$GITHUB_OUTPUT"
 
       - name: 新規リリース判定
@@ -106,7 +134,7 @@ jobs:
         id: compare
         env:
           LATEST_TAG: ${{ steps.fetch.outputs.tag }}
-          LAST_TAG: ${{ steps.previous.outputs.last_tag }}
+          LAST_TAG: ${{ steps.state.outputs.last_tag }}
         run: |
           set -euo pipefail
           if [ "$LATEST_TAG" = "$LAST_TAG" ]; then
@@ -155,27 +183,29 @@ jobs:
             -d '${{ steps.message.outputs.payload }}' \
             "$MATTERMOST_WEBHOOK_URL"
 
-      - name: 最終通知タグ更新
+      - name: 状態更新
         if: steps.compare.outputs.changed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.state.outputs.issue_number }}
           LATEST_TAG: ${{ steps.fetch.outputs.tag }}
-          VARIABLE_EXISTS: ${{ steps.previous.outputs.exists }}
         run: |
           set -euo pipefail
-          data=$(jq -n --arg value "$LATEST_TAG" '{name:"LAST_SEEN_RELEASE", value:$value}')
-          url="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/variables"
+          state_json=$(jq -n --arg tag "$LATEST_TAG" '{last_tag:$tag}')
+          payload=$(jq -n --arg body "$state_json" '{body:$body}')
 
-          if [ "$VARIABLE_EXISTS" = "true" ]; then
-            curl -sS -X PATCH \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'Content-Type: application/json' \
-              -d "$data" \
-              "$url/LAST_SEEN_RELEASE" >/dev/null
-          else
-            curl -sS -X POST \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'Content-Type: application/json' \
-              -d "$data" \
-              "$url" >/dev/null
+          tmp=$(mktemp)
+          status=$(curl -sS -w '%{http_code}' \
+            -X PATCH \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -o "$tmp" \
+            -d "$payload" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}")
+
+          if [ "$status" -ne 200 ]; then
+            echo "GitHub API error: HTTP $status" >&2
+            cat "$tmp" >&2 || true
+            exit 1
           fi

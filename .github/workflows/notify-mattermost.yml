@@ -656,30 +656,40 @@ jobs:
               source = 'release' if release_body else ''
               candidates = build_candidates(entry.get('tag') or '')
 
-              def use_changelog():
-                  nonlocal content, source
+              def load_changelog():
                   changelog_text, changelog_source = fetch_changelog(entry, candidates)
                   if changelog_text:
-                      content = changelog_text.strip()
-                      source = changelog_source or 'changelog'
+                      return changelog_text.strip(), changelog_source or 'changelog'
+                  return None, None
 
-              def use_npm():
-                  nonlocal content, source
+              def load_npm():
                   npm_text, npm_source = fetch_npm(entry, candidates)
                   if npm_text:
-                      content = npm_text.strip()
-                      source = npm_source or 'npm'
+                      return npm_text.strip(), npm_source or 'npm'
+                  return None, None
 
               if reference_kind == 'release':
                   if not content:
-                      use_changelog()
-                      if not content:
-                          use_npm()
+                      changelog_text, changelog_source = load_changelog()
+                      if changelog_text:
+                          content = changelog_text
+                          source = changelog_source
+                  if not content:
+                      npm_text, npm_source = load_npm()
+                      if npm_text:
+                          content = npm_text
+                          source = npm_source
               else:
                   if not content:
-                      use_changelog()
+                      changelog_text, changelog_source = load_changelog()
+                      if changelog_text:
+                          content = changelog_text
+                          source = changelog_source
                   if not content:
-                      use_npm()
+                      npm_text, npm_source = load_npm()
+                      if npm_text:
+                          content = npm_text
+                          source = npm_source
 
               if not content:
                   source = source or 'none'

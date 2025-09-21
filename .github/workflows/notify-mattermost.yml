@@ -99,45 +99,187 @@ jobs:
       - name: 最新リリース取得
         id: fetch
         env:
+          TARGET_REPO: ${{ env.TARGET_REPO }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          tmp_json=$(mktemp)
-          status=$(curl -sS -w '%{http_code}' \
-            -H 'Accept: application/vnd.github+json' \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -o "$tmp_json" \
-            "https://api.github.com/repos/${TARGET_REPO}/releases/latest")
+          python <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
 
-          if [ "$status" -eq 404 ]; then
-            echo "release_found=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          repo = os.environ.get('TARGET_REPO')
+          if not repo:
+              print('TARGET_REPO is required', file=sys.stderr)
+              sys.exit(1)
+          token = os.environ.get('GITHUB_TOKEN', '')
 
-          if [ "$status" -ne 200 ]; then
-            echo "GitHub API error: HTTP $status" >&2
-            cat "$tmp_json" >&2 || true
-            exit 1
-          fi
+          base_headers = {
+              'Accept': 'application/vnd.github+json',
+              'User-Agent': 'release-monitor-action',
+          }
+          if token:
+              base_headers['Authorization'] = f'Bearer {token}'
 
-          tag=$(jq -r '.tag_name // empty' "$tmp_json")
-          if [ -z "$tag" ]; then
-            echo "release_found=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          def request(url, accept=None):
+              headers = dict(base_headers)
+              if accept:
+                  headers['Accept'] = accept
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return resp.getcode(), resp.read()
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read()
+              except Exception as exc:
+                  print(f'HTTP request failed: {exc}', file=sys.stderr)
+                  return None, b''
 
-          name=$(jq -r '.name // empty' "$tmp_json")
-          url=$(jq -r '.html_url // empty' "$tmp_json")
-          body=$(jq -r '.body // empty' "$tmp_json")
+          status, data = request(f'https://api.github.com/repos/{repo}')
+          if status != 200 or not data:
+              print(f'GitHub API error fetching repository info: HTTP {status}', file=sys.stderr)
+              sys.exit(1)
+          try:
+              repo_info = json.loads(data.decode('utf-8'))
+          except Exception as exc:
+              print(f'Failed to parse repository info: {exc}', file=sys.stderr)
+              sys.exit(1)
 
-          {
-            echo "release_found=true"
-            printf 'tag=%s\n' "$tag"
-            printf 'name=%s\n' "$name"
-            printf 'url=%s\n' "$url"
-            printf 'body<<EOF\n%s\nEOF\n' "$body"
-          } >> "$GITHUB_OUTPUT"
+          default_branch = repo_info.get('default_branch') or ''
 
+          outputs = {}
+          reference_sha = ''
+
+          status, data = request(f'https://api.github.com/repos/{repo}/releases/latest')
+          if status == 200 and data:
+              try:
+                  release = json.loads(data.decode('utf-8', errors='replace'))
+              except Exception as exc:
+                  print(f'Failed to parse release: {exc}', file=sys.stderr)
+                  release = None
+              if release:
+                  tag = (release.get('tag_name') or '').strip()
+                  if tag:
+                      outputs.update({
+                          'release_found': 'true',
+                          'reference_kind': 'release',
+                          'tag': tag,
+                          'name': (release.get('name') or tag).strip(),
+                          'url': release.get('html_url') or '',
+                          'body': release.get('body') or '',
+                          'default_branch': release.get('target_commitish') or default_branch,
+                      })
+                      reference_sha = (release.get('target_commitish') or '').strip()
+          elif status == 404:
+              pass
+          else:
+              print(f'GitHub API error fetching latest release: HTTP {status}', file=sys.stderr)
+              if data:
+                  try:
+                      print(data.decode('utf-8', errors='replace'), file=sys.stderr)
+                  except Exception:
+                      pass
+              sys.exit(1)
+
+          if not outputs:
+              status, data = request(f'https://api.github.com/repos/{repo}/tags?per_page=1')
+              if status == 200 and data:
+                  try:
+                      tags = json.loads(data.decode('utf-8'))
+                  except Exception as exc:
+                      print(f'Failed to parse tags: {exc}', file=sys.stderr)
+                      tags = []
+                  if tags:
+                      tag_entry = tags[0]
+                      tag_name = (tag_entry.get('name') or '').strip()
+                      commit_sha = ((tag_entry.get('commit') or {}).get('sha') or '').strip()
+                      if tag_name:
+                          reference_sha = commit_sha
+                          outputs.update({
+                              'release_found': 'true',
+                              'reference_kind': 'tag',
+                              'tag': tag_name,
+                              'name': tag_name,
+                              'url': f'https://github.com/{repo}/tree/{tag_name}',
+                              'body': '',
+                              'default_branch': default_branch,
+                          })
+
+          if not outputs and default_branch:
+              paths = [
+                  'CHANGELOG.md',
+                  'CHANGE.md',
+                  'docs/CHANGELOG.md',
+                  'docs/CHANGE.md',
+                  'CHANGELOG',
+                  'docs/CHANGELOG',
+              ]
+              for path in paths:
+                  status, data = request(f'https://api.github.com/repos/{repo}/commits?sha={default_branch}&path={path}&per_page=1')
+                  if status != 200 or not data:
+                      continue
+                  try:
+                      commits = json.loads(data.decode('utf-8'))
+                  except Exception:
+                      continue
+                  if not commits:
+                      continue
+                  commit = commits[0]
+                  sha = (commit.get('sha') or '').strip()
+                  if not sha:
+                      continue
+                  reference_sha = sha
+                  outputs.update({
+                      'release_found': 'true',
+                      'reference_kind': 'changelog',
+                      'tag': f'changelog-{sha[:12]}',
+                      'name': f'{path} update',
+                      'url': f'https://github.com/{repo}/blob/{default_branch}/{path}',
+                      'body': '',
+                      'default_branch': default_branch,
+                      'fallback_branch': default_branch,
+                      'fallback_path': path,
+                  })
+                  break
+
+          outputs.setdefault('default_branch', default_branch or '')
+
+          if not outputs:
+              outputs = {
+                  'release_found': 'false',
+                  'reference_kind': '',
+                  'tag': '',
+                  'name': '',
+                  'url': '',
+                  'body': '',
+                  'default_branch': default_branch or '',
+              }
+
+          if reference_sha:
+              outputs['reference_sha'] = reference_sha
+          else:
+              outputs.setdefault('reference_sha', '')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              for key, value in outputs.items():
+                  value = value or ''
+                  if key == 'body':
+                      if value:
+                          fh.write('body<<EOF
+')
+                          fh.write(value)
+                          fh.write('
+EOF
+')
+                      else:
+                          fh.write('body=
+')
+                      continue
+                  fh.write(f'{key}={value}
+')
+          PY
       - name: 状態読み込み
         if: steps.fetch.outputs.release_found == 'true'
         id: state
@@ -207,6 +349,11 @@ jobs:
           RELEASE_TAG: ${{ steps.fetch.outputs.tag }}
           RELEASE_BODY: ${{ steps.fetch.outputs.body }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REFERENCE_KIND: ${{ steps.fetch.outputs.reference_kind }}
+          DEFAULT_BRANCH: ${{ steps.fetch.outputs.default_branch }}
+          FALLBACK_BRANCH: ${{ steps.fetch.outputs.fallback_branch }}
+          FALLBACK_PATH: ${{ steps.fetch.outputs.fallback_path }}
+          REFERENCE_SHA: ${{ steps.fetch.outputs.reference_sha }}
         run: |
           set -euo pipefail
           python <<'PY'
@@ -225,6 +372,11 @@ jobs:
           target_repo = os.environ.get('TARGET_REPO', '')
           tag = os.environ.get('RELEASE_TAG', '')
           token = os.environ.get('GITHUB_TOKEN', '')
+          reference_kind = (os.environ.get('REFERENCE_KIND', '') or '').strip().lower() or 'release'
+          fallback_branch = os.environ.get('FALLBACK_BRANCH', '') or ''
+          fallback_path = os.environ.get('FALLBACK_PATH', '') or ''
+          default_branch = os.environ.get('DEFAULT_BRANCH', '') or ''
+          reference_sha = (os.environ.get('REFERENCE_SHA', '') or '').strip()
 
           content = release_body.strip()
           source = 'release' if content else ''
@@ -289,9 +441,9 @@ jobs:
               return trimmed
 
           def fetch_changelog():
-              if not target_repo or not tag:
+              if not target_repo:
                   return None, None
-              paths = [
+              base_paths = [
                   'CHANGELOG.md',
                   'CHANGE.md',
                   'docs/CHANGELOG.md',
@@ -299,35 +451,63 @@ jobs:
                   'CHANGELOG',
                   'docs/CHANGELOG',
               ]
-              for path in paths:
-                  url = f'https://api.github.com/repos/{target_repo}/contents/{path}?ref={tag}'
-                  headers = {
-                      'Accept': 'application/vnd.github.raw',
-                      'User-Agent': 'release-monitor-action',
-                  }
-                  if token:
-                      headers['Authorization'] = f'Bearer {token}'
-                  req = urllib.request.Request(url, headers=headers)
-                  try:
-                      with urllib.request.urlopen(req) as resp:
-                          data = resp.read().decode('utf-8', errors='replace')
-                  except urllib.error.HTTPError as exc:
-                      if exc.code not in (403, 404):
-                          log(f'GitHub API error for {path}: {exc}')
-                      if exc.code == 403 and not token:
-                          log('GitHub API rate limited and no token provided.')
-                      continue
-                  except Exception as exc:
-                      log(f'Failed to fetch {path}: {exc}')
-                      continue
-                  section = extract_section(data)
-                  if section:
-                      return section, f'changelog:{path}'
-                  trimmed = data.strip()
-                  if trimmed:
-                      if len(trimmed) > 4000:
-                          trimmed = trimmed[:4000].rstrip() + '\n...'
-                      return trimmed, f'changelog:{path}'
+              normalized_fallback = fallback_path.strip()
+              ordered_paths = []
+              if normalized_fallback:
+                  ordered_paths.append(normalized_fallback)
+              for path in base_paths:
+                  if path not in ordered_paths:
+                      ordered_paths.append(path)
+
+              ref_candidates = []
+              if reference_kind in ('release', 'tag'):
+                  if tag:
+                      ref_candidates.append(tag)
+                  if reference_sha and reference_sha not in ref_candidates:
+                      ref_candidates.append(reference_sha)
+              elif reference_kind == 'changelog':
+                  if reference_sha:
+                      ref_candidates.append(reference_sha)
+                  if fallback_branch and fallback_branch not in ref_candidates:
+                      ref_candidates.append(fallback_branch)
+              if default_branch and default_branch not in ref_candidates:
+                  ref_candidates.append(default_branch)
+              if not ref_candidates:
+                  ref_candidates = [None]
+
+              for path in ordered_paths:
+                  for ref in ref_candidates:
+                      url = f'https://api.github.com/repos/{target_repo}/contents/{path}'
+                      if ref:
+                          url = f'{url}?ref={ref}'
+                      headers = {
+                          'Accept': 'application/vnd.github.raw',
+                          'User-Agent': 'release-monitor-action',
+                      }
+                      if token:
+                          headers['Authorization'] = f'Bearer {token}'
+                      req = urllib.request.Request(url, headers=headers)
+                      try:
+                          with urllib.request.urlopen(req) as resp:
+                              data = resp.read().decode('utf-8', errors='replace')
+                      except urllib.error.HTTPError as exc:
+                          if exc.code not in (403, 404):
+                              ref_label = ref or 'default'
+                              log(f'GitHub API error for {path} (ref {ref_label}): {exc}')
+                          if exc.code == 403 and not token:
+                              log('GitHub API rate limited and no token provided.')
+                          continue
+                      except Exception as exc:
+                          log(f'Failed to fetch {path}: {exc}')
+                          continue
+                      section = extract_section(data)
+                      if section:
+                          return section, f'changelog:{path}'
+                      trimmed = data.strip()
+                      if trimmed:
+                          if len(trimmed) > 4000:
+                              trimmed = trimmed[:4000].rstrip() + '\n...'
+                          return trimmed, f'changelog:{path}'
               return None, None
 
           def fetch_npm():

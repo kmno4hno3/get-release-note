@@ -736,20 +736,19 @@ jobs:
                   continue
               prompt = textwrap.dedent(
                   """
-                  あなたはリリースノートを日本語に翻訳するアシスタントです。次のテンプレートに従い、プレーンテキストで出力してください（コードフェンス禁止）。
+                  あなたはリリースノートを日本語で要約するアシスタントです。以下の条件に従って、Markdown整形のみを用いたテキスト（コードフェンスなし）を出力してください。
 
-                  リリースノート
-
-                  新機能
-                  <新機能があれば箇条書きで記載。なければ「該当なし」と書く。>
-
-                  マージされたPR:
-                  <関連するPR番号と要約を箇条書きで記載。情報が無ければ「情報なし」と書く。>
-
-                  主な更新点:
-                  <3〜5行程度で日本語の要約を記載。必要なら箇条書きを使用。>
-
-                  各セクションでは角括弧付きの指示文を出力せず、実際の内容もしくは指定された定型文だけを記載してください。
+                  1. 先頭に1行だけ "リリースノート" と記載する。
+                  2. 続けて空行を1行入れた後、必ず次の3セクションをこの順に出力する。
+                     - 見出し "## 新機能"
+                     - 見出し "## マージされたPR:"
+                     - 水平線 "---" の後に見出し "### 主な更新点:"
+                  3. 各セクションの内容は以下の通り。
+                     - 新機能: 箇条書き（- から始める）で記載。該当が無ければ "- 該当なし" と書く。
+                     - マージされたPR: 箇条書きで [#番号] 要約 の形式にする。情報が無ければ "- 情報なし" と書く。
+                     - 主な更新点: 箇条書きで重要なトピックを3〜5行程度まとめる。内容が不足していれば推測せず "- 情報なし" と書く。
+                  4. 箇条書きはすべて半角ハイフンの後に半角スペース1つで書く。
+                  5. 角括弧で囲まれた指示文や余計な前置き文は出力しない。
 
                   入力テキスト:
                   -----
@@ -835,18 +834,21 @@ jobs:
               if source_line:
                   lines.append(source_line)
 
+              lines.append('')
+              lines.append('リリースノート')
               if translated:
+                  lines.append('```markdown')
                   lines.append('')
-                  lines.extend(translated.splitlines())
+                  lines.extend(translated.strip().splitlines())
+                  lines.append('```')
               else:
                   fallback = truncate(content)
                   if fallback:
-                      lines.append('')
-                      lines.append('リリースノート')
+                      lines.append('```markdown')
                       lines.append('')
                       lines.append(fallback)
+                      lines.append('```')
                   else:
-                      lines.append('')
                       lines.append('リリースノート情報を取得できませんでした。')
 
               payloads.append(json.dumps({'text': '\n'.join(lines)}, ensure_ascii=False))

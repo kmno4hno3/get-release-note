@@ -650,22 +650,36 @@ jobs:
 
           results = []
           for entry in entries:
+              reference_kind = (entry.get('reference_kind') or '').lower()
               release_body = (entry.get('body') or '').strip()
               content = release_body
               source = 'release' if release_body else ''
               candidates = build_candidates(entry.get('tag') or '')
 
-              if not content:
+              def use_changelog():
+                  nonlocal content, source
                   changelog_text, changelog_source = fetch_changelog(entry, candidates)
                   if changelog_text:
                       content = changelog_text.strip()
                       source = changelog_source or 'changelog'
 
-              if not content:
+              def use_npm():
+                  nonlocal content, source
                   npm_text, npm_source = fetch_npm(entry, candidates)
                   if npm_text:
                       content = npm_text.strip()
                       source = npm_source or 'npm'
+
+              if reference_kind == 'release':
+                  if not content:
+                      use_changelog()
+                      if not content:
+                          use_npm()
+              else:
+                  if not content:
+                      use_changelog()
+                  if not content:
+                      use_npm()
 
               if not content:
                   source = source or 'none'

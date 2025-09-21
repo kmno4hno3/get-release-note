@@ -104,6 +104,7 @@ jobs:
         run: |
           set -euo pipefail
           python <<'PY'
+          import base64
           import json
           import os
           import sys
@@ -147,67 +148,91 @@ jobs:
               print(f'Failed to parse repository info: {exc}', file=sys.stderr)
               sys.exit(1)
 
-          default_branch = repo_info.get('default_branch') or ''
+          default_branch = (repo_info.get('default_branch') or '').strip()
+          entries = []
 
-          outputs = {}
-          reference_sha = ''
+          def add_release_entry(release):
+              tag = (release.get('tag_name') or '').strip()
+              if not tag:
+                  return
+              name = (release.get('name') or tag).strip()
+              target_commitish = (release.get('target_commitish') or '').strip()
+              entries.append({
+                  'tag': tag,
+                  'name': name,
+                  'url': release.get('html_url') or f'https://github.com/{repo}/releases/tag/{tag}',
+                  'body': release.get('body') or '',
+                  'reference_kind': 'release',
+                  'reference_sha': target_commitish,
+                  'default_branch': target_commitish or default_branch,
+                  'fallback_branch': '',
+                  'fallback_path': '',
+                  'published_at': release.get('published_at') or '',
+              })
 
-          status, data = request(f'https://api.github.com/repos/{repo}/releases/latest')
+          def add_tag_entry(tag_entry):
+              tag_name = (tag_entry.get('name') or '').strip()
+              if not tag_name:
+                  return
+              commit_sha = ''
+              commit = tag_entry.get('commit') or {}
+              if isinstance(commit, dict):
+                  commit_sha = (commit.get('sha') or '').strip()
+              entries.append({
+                  'tag': tag_name,
+                  'name': tag_name,
+                  'url': f'https://github.com/{repo}/tree/{tag_name}',
+                  'body': '',
+                  'reference_kind': 'tag',
+                  'reference_sha': commit_sha,
+                  'default_branch': default_branch,
+                  'fallback_branch': default_branch,
+                  'fallback_path': '',
+                  'published_at': '',
+              })
+
+          def add_changelog_entry(path, commit):
+              sha = (commit.get('sha') or '').strip()
+              if not sha:
+                  return
+              tag = f'changelog-{sha[:12]}'
+              entries.append({
+                  'tag': tag,
+                  'name': f'{path} update',
+                  'url': f'https://github.com/{repo}/blob/{default_branch}/{path}',
+                  'body': '',
+                  'reference_kind': 'changelog',
+                  'reference_sha': sha,
+                  'default_branch': default_branch,
+                  'fallback_branch': default_branch,
+                  'fallback_path': path,
+                  'published_at': commit.get('commit', {}).get('author', {}).get('date', ''),
+              })
+
+          status, data = request(f'https://api.github.com/repos/{repo}/releases?per_page=20')
           if status == 200 and data:
               try:
-                  release = json.loads(data.decode('utf-8', errors='replace'))
+                  releases = json.loads(data.decode('utf-8', errors='replace'))
               except Exception as exc:
-                  print(f'Failed to parse release: {exc}', file=sys.stderr)
-                  release = None
-              if release:
-                  tag = (release.get('tag_name') or '').strip()
-                  if tag:
-                      outputs.update({
-                          'release_found': 'true',
-                          'reference_kind': 'release',
-                          'tag': tag,
-                          'name': (release.get('name') or tag).strip(),
-                          'url': release.get('html_url') or '',
-                          'body': release.get('body') or '',
-                          'default_branch': release.get('target_commitish') or default_branch,
-                      })
-                      reference_sha = (release.get('target_commitish') or '').strip()
-          elif status == 404:
-              pass
-          else:
-              print(f'GitHub API error fetching latest release: HTTP {status}', file=sys.stderr)
-              if data:
-                  try:
-                      print(data.decode('utf-8', errors='replace'), file=sys.stderr)
-                  except Exception:
-                      pass
-              sys.exit(1)
+                  print(f'Failed to parse releases list: {exc}', file=sys.stderr)
+                  releases = []
+              if isinstance(releases, list):
+                  for release in releases:
+                      add_release_entry(release)
 
-          if not outputs:
-              status, data = request(f'https://api.github.com/repos/{repo}/tags?per_page=1')
+          if not entries:
+              status, data = request(f'https://api.github.com/repos/{repo}/tags?per_page=20')
               if status == 200 and data:
                   try:
                       tags = json.loads(data.decode('utf-8'))
                   except Exception as exc:
                       print(f'Failed to parse tags: {exc}', file=sys.stderr)
                       tags = []
-                  if tags:
-                      tag_entry = tags[0]
-                      tag_name = (tag_entry.get('name') or '').strip()
-                      commit_sha = ((tag_entry.get('commit') or {}).get('sha') or '').strip()
-                      if tag_name:
-                          reference_sha = commit_sha
-                          outputs.update({
-                              'release_found': 'true',
-                              'reference_kind': 'tag',
-                              'tag': tag_name,
-                              'name': tag_name,
-                              'url': f'https://github.com/{repo}/tree/{tag_name}',
-                              'body': '',
-                              'default_branch': default_branch,
-                          })
+                  if isinstance(tags, list):
+                      for tag_entry in tags:
+                          add_tag_entry(tag_entry)
 
-          if not outputs and default_branch:
+          if not entries and default_branch:
               paths = [
                   'CHANGELOG.md',
                   'CHANGE.md',
@@ -217,36 +242,37 @@ jobs:
                   'docs/CHANGELOG',
               ]
               for path in paths:
-                  status, data = request(f'https://api.github.com/repos/{repo}/commits?sha={default_branch}&path={path}&per_page=1')
+                  status, data = request(f'https://api.github.com/repos/{repo}/commits?sha={default_branch}&path={path}&per_page=5')
                   if status != 200 or not data:
                       continue
                   try:
                       commits = json.loads(data.decode('utf-8'))
-                  except Exception:
+                  except Exception as exc:
+                      print(f'Failed to parse commits for {path}: {exc}', file=sys.stderr)
                       continue
-                  if not commits:
+                  if not isinstance(commits, list):
                       continue
-                  commit = commits[0]
-                  sha = (commit.get('sha') or '').strip()
-                  if not sha:
-                      continue
-                  reference_sha = sha
-                  outputs.update({
-                      'release_found': 'true',
-                      'reference_kind': 'changelog',
-                      'tag': f'changelog-{sha[:12]}',
-                      'name': f'{path} update',
-                      'url': f'https://github.com/{repo}/blob/{default_branch}/{path}',
-                      'body': '',
-                      'default_branch': default_branch,
-                      'fallback_branch': default_branch,
-                      'fallback_path': path,
-                  })
-                  break
+                  for commit in commits:
+                      add_changelog_entry(path, commit)
+                  if entries:
+                      break
 
-          outputs.setdefault('default_branch', default_branch or '')
-
-          if not outputs:
+          outputs = {}
+          if entries:
+              first = entries[0]
+              outputs = {
+                  'release_found': 'true',
+                  'reference_kind': first.get('reference_kind', ''),
+                  'tag': first.get('tag', ''),
+                  'name': first.get('name', ''),
+                  'url': first.get('url', ''),
+                  'body': first.get('body', ''),
+                  'default_branch': first.get('default_branch', ''),
+                  'fallback_branch': first.get('fallback_branch', ''),
+                  'fallback_path': first.get('fallback_path', ''),
+                  'reference_sha': first.get('reference_sha', ''),
+              }
+          else:
               outputs = {
                   'release_found': 'false',
                   'reference_kind': '',
@@ -254,13 +280,14 @@ jobs:
                   'name': '',
                   'url': '',
                   'body': '',
-                  'default_branch': default_branch or '',
+                  'default_branch': default_branch,
+                  'fallback_branch': '',
+                  'fallback_path': '',
+                  'reference_sha': '',
               }
 
-          if reference_sha:
-              outputs['reference_sha'] = reference_sha
-          else:
-              outputs.setdefault('reference_sha', '')
+          entries_json = json.dumps(entries, ensure_ascii=False)
+          entries_b64 = base64.b64encode(entries_json.encode('utf-8')).decode('ascii')
 
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
               for key, value in outputs.items():
@@ -274,7 +301,9 @@ jobs:
                           fh.write('body=\n')
                       continue
                   fh.write(f'{key}={value}\n')
+              fh.write(f'entries_b64={entries_b64}\n')
           PY
+
       - name: 状態読み込み
         if: steps.fetch.outputs.release_found == 'true'
         id: state
@@ -291,6 +320,7 @@ jobs:
 
           download_url=$(printf '%s\n' "$response" | jq -r --arg name "$ARTIFACT_NAME" \
             '[.artifacts[] | select(.name == $name and .expired == false)] | sort_by(.created_at) | last | .archive_download_url')
+
 
           artifact_id=$(printf '%s\n' "$response" | jq -r --arg name "$ARTIFACT_NAME" \
             '[.artifacts[] | select(.name == $name and .expired == false)] | sort_by(.created_at) | last | .id')
@@ -322,36 +352,87 @@ jobs:
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}" >/dev/null
           fi
 
+      - name: 新規エントリ抽出
+        if: steps.fetch.outputs.release_found == 'true'
+        id: filter
+        env:
+          ENTRIES_B64: ${{ steps.fetch.outputs.entries_b64 }}
+          LAST_TAG: ${{ steps.state.outputs.last_tag }}
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          import base64
+          import json
+          import os
+
+          entries_b64 = os.environ.get('ENTRIES_B64', '') or ''
+          if entries_b64:
+              try:
+                  entries = json.loads(base64.b64decode(entries_b64).decode('utf-8'))
+              except Exception:
+                  entries = []
+          else:
+              entries = []
+
+          last_tag = (os.environ.get('LAST_TAG') or '').strip()
+          new_entries = []
+          found_last = False
+          for entry in entries:
+              tag = (entry.get('tag') or '').strip()
+              if last_tag and tag == last_tag:
+                  found_last = True
+                  break
+              new_entries.append(entry)
+
+          if last_tag and not found_last and entries and new_entries and len(new_entries) == len(entries):
+              pass
+
+          new_entries.reverse()
+          filtered_json = json.dumps(new_entries, ensure_ascii=False)
+          filtered_b64 = base64.b64encode(filtered_json.encode('utf-8')).decode('ascii')
+
+          latest_tag = ''
+          if entries:
+              latest_tag = (entries[0].get('tag') or '').strip()
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write(f'entry_count={len(new_entries)}\n')
+              fh.write(f'entries_b64={filtered_b64}\n')
+              fh.write(f'latest_tag={latest_tag}\n')
+          PY
+
       - name: 新規リリース判定
         if: steps.fetch.outputs.release_found == 'true'
         id: compare
         env:
-          LATEST_TAG: ${{ steps.fetch.outputs.tag }}
-          LAST_TAG: ${{ steps.state.outputs.last_tag }}
+          ENTRY_COUNT: ${{ steps.filter.outputs.entry_count }}
         run: |
           set -euo pipefail
-          if [ "$LATEST_TAG" = "$LAST_TAG" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+          python <<'PY'
+          import os
+
+          try:
+              entry_count = int(os.environ.get('ENTRY_COUNT', '0') or '0')
+          except ValueError:
+              entry_count = 0
+
+          changed = 'true' if entry_count > 0 else 'false'
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write(f'changed={changed}\n')
+          PY
 
       - name: リリースノート収集
         if: steps.compare.outputs.changed == 'true'
         id: content
         env:
           TARGET_REPO: ${{ env.TARGET_REPO }}
-          RELEASE_TAG: ${{ steps.fetch.outputs.tag }}
-          RELEASE_BODY: ${{ steps.fetch.outputs.body }}
+          ENTRIES_B64: ${{ steps.filter.outputs.entries_b64 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REFERENCE_KIND: ${{ steps.fetch.outputs.reference_kind }}
-          DEFAULT_BRANCH: ${{ steps.fetch.outputs.default_branch }}
-          FALLBACK_BRANCH: ${{ steps.fetch.outputs.fallback_branch }}
-          FALLBACK_PATH: ${{ steps.fetch.outputs.fallback_path }}
-          REFERENCE_SHA: ${{ steps.fetch.outputs.reference_sha }}
         run: |
           set -euo pipefail
           python <<'PY'
+          import base64
           import json
           import os
           import re
@@ -363,18 +444,14 @@ jobs:
           def log(msg):
               print(msg, file=sys.stderr)
 
-          release_body = os.environ.get('RELEASE_BODY', '') or ''
-          target_repo = os.environ.get('TARGET_REPO', '')
-          tag = os.environ.get('RELEASE_TAG', '')
-          token = os.environ.get('GITHUB_TOKEN', '')
-          reference_kind = (os.environ.get('REFERENCE_KIND', '') or '').strip().lower() or 'release'
-          fallback_branch = os.environ.get('FALLBACK_BRANCH', '') or ''
-          fallback_path = os.environ.get('FALLBACK_PATH', '') or ''
-          default_branch = os.environ.get('DEFAULT_BRANCH', '') or ''
-          reference_sha = (os.environ.get('REFERENCE_SHA', '') or '').strip()
+          entries_b64 = os.environ.get('ENTRIES_B64', '') or ''
+          try:
+              entries = json.loads(base64.b64decode(entries_b64).decode('utf-8'))
+          except Exception:
+              entries = []
 
-          content = release_body.strip()
-          source = 'release' if content else ''
+          target_repo = os.environ.get('TARGET_REPO', '')
+          token = os.environ.get('GITHUB_TOKEN', '')
 
           def build_candidates(tag_value):
               values = []
@@ -399,9 +476,7 @@ jobs:
                       seen.add(normalized)
               return normed
 
-          candidates = build_candidates(tag)
-
-          def extract_section(text):
+          def extract_section(text, candidates):
               if not text.strip():
                   return ''
               lines = text.splitlines()
@@ -435,9 +510,13 @@ jobs:
                   return trimmed[:4000].rstrip() + '\n...'
               return trimmed
 
-          def fetch_changelog():
-              if not target_repo:
-                  return None, None
+          def fetch_changelog(entry, candidates):
+              reference_kind = (entry.get('reference_kind') or '').lower()
+              default_branch = entry.get('default_branch') or ''
+              fallback_branch = entry.get('fallback_branch') or ''
+              fallback_path = entry.get('fallback_path') or ''
+              reference_sha = entry.get('reference_sha') or ''
+
               base_paths = [
                   'CHANGELOG.md',
                   'CHANGE.md',
@@ -446,16 +525,17 @@ jobs:
                   'CHANGELOG',
                   'docs/CHANGELOG',
               ]
-              normalized_fallback = fallback_path.strip()
+
               ordered_paths = []
-              if normalized_fallback:
-                  ordered_paths.append(normalized_fallback)
+              if fallback_path:
+                  ordered_paths.append(fallback_path)
               for path in base_paths:
                   if path not in ordered_paths:
                       ordered_paths.append(path)
 
               ref_candidates = []
               if reference_kind in ('release', 'tag'):
+                  tag = entry.get('tag') or ''
                   if tag:
                       ref_candidates.append(tag)
                   if reference_sha and reference_sha not in ref_candidates:
@@ -495,7 +575,7 @@ jobs:
                       except Exception as exc:
                           log(f'Failed to fetch {path}: {exc}')
                           continue
-                      section = extract_section(data)
+                      section = extract_section(data, candidates)
                       if section:
                           return section, f'changelog:{path}'
                       trimmed = data.strip()
@@ -505,13 +585,14 @@ jobs:
                           return trimmed, f'changelog:{path}'
               return None, None
 
-          def fetch_npm():
+          def fetch_npm(entry, candidates):
               package = os.environ.get('NPM_PACKAGE') or ''
               if not package:
                   if target_repo and '/' in target_repo:
                       package = target_repo.split('/')[-1]
               if not package:
                   return None, None
+              tag = entry.get('tag') or ''
               version = ''
               if tag:
                   version = tag.lstrip('v')
@@ -550,7 +631,7 @@ jobs:
                   parts.append(str(release_notes).strip())
               readme = data.get('readme')
               if readme:
-                  section = extract_section(readme)
+                  section = extract_section(readme, candidates)
                   if section:
                       parts.append(section)
               time_info = data.get('time') or {}
@@ -567,31 +648,49 @@ jobs:
                   text = text[:4000].rstrip() + '\n...'
               return text, f'npm:{package}@{version}'
 
-          if not content:
-              changelog_text, changelog_source = fetch_changelog()
-              if changelog_text:
-                  content = changelog_text.strip()
-                  source = changelog_source or 'changelog'
-          if not content:
-              npm_text, npm_source = fetch_npm()
-              if npm_text:
-                  content = npm_text.strip()
-                  source = npm_source or 'npm'
-          if not content:
-              source = source or 'none'
+          results = []
+          for entry in entries:
+              release_body = (entry.get('body') or '').strip()
+              content = release_body
+              source = 'release' if release_body else ''
+              candidates = build_candidates(entry.get('tag') or '')
+
+              if not content:
+                  changelog_text, changelog_source = fetch_changelog(entry, candidates)
+                  if changelog_text:
+                      content = changelog_text.strip()
+                      source = changelog_source or 'changelog'
+
+              if not content:
+                  npm_text, npm_source = fetch_npm(entry, candidates)
+                  if npm_text:
+                      content = npm_text.strip()
+                      source = npm_source or 'npm'
+
+              if not content:
+                  source = source or 'none'
+
+              results.append({
+                  'tag': entry.get('tag', ''),
+                  'name': entry.get('name', ''),
+                  'url': entry.get('url', ''),
+                  'content': content.strip(),
+                  'source': source,
+              })
+
+          processed_json = json.dumps(results, ensure_ascii=False)
+          processed_b64 = base64.b64encode(processed_json.encode('utf-8')).decode('ascii')
 
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
-              fh.write('content<<EOF\n')
-              fh.write(content)
-              fh.write('\nEOF\n')
-              fh.write(f'source={source}\n')
+              fh.write(f'processed_b64={processed_b64}\n')
+              fh.write(f'processed_count={len(results)}\n')
           PY
 
       - name: リリースノート翻訳
         if: steps.compare.outputs.changed == 'true'
         id: translate
         env:
-          RELEASE_TEXT: ${{ steps.content.outputs.content }}
+          PROCESSED_B64: ${{ steps.content.outputs.processed_b64 }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ env.GEMINI_MODEL }}
         run: |
@@ -601,21 +700,18 @@ jobs:
             exit 1
           fi
           python3 -m pip install --upgrade --quiet google-generativeai
-          body="${RELEASE_TEXT:-}"
-          if [ -z "$body" ]; then
-            echo "translated=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           python <<'PY'
+          import base64
+          import json
           import os
           import sys
           import textwrap
 
-          body = os.environ.get('RELEASE_TEXT', '')
-          if not body.strip():
-              with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
-                  fh.write('translated=\n')
-              sys.exit(0)
+          processed_b64 = os.environ.get('PROCESSED_B64', '') or ''
+          try:
+              entries = json.loads(base64.b64decode(processed_b64).decode('utf-8'))
+          except Exception:
+              entries = []
 
           api_key = os.environ.get('GEMINI_API_KEY')
           if not api_key:
@@ -631,40 +727,42 @@ jobs:
               sys.exit(1)
 
           genai.configure(api_key=api_key)
-          prompt = textwrap.dedent(
-              """
-              Translate the following release note content into Japanese. Preserve Markdown formatting, keep code fences, and conclude with a Japanese bullet list summarizing the key updates.
+          model = genai.GenerativeModel(model_name)
 
-              -----
-              {body}
-              """
-          ).format(body=body)
+          for entry in entries:
+              body = (entry.get('content') or '').strip()
+              if not body:
+                  entry['translated'] = ''
+                  continue
+              prompt = textwrap.dedent(
+                  """
+                  Translate the following release note content into Japanese. Preserve Markdown formatting, keep code fences, and conclude with a Japanese bullet list summarizing the key updates.
 
-          try:
-              model = genai.GenerativeModel(model_name)
-              response = model.generate_content(prompt)
-          except Exception as exc:
-              print(f'Gemini generate_content failed: {exc}', file=sys.stderr)
-              sys.exit(1)
+                  -----
+                  {body}
+                  """
+              ).format(body=body)
+              try:
+                  response = model.generate_content(prompt)
+              except Exception as exc:
+                  print(f'Gemini generate_content failed for {entry.get("tag")}: {exc}', file=sys.stderr)
+                  entry['translated'] = ''
+                  continue
+              text = ''
+              if hasattr(response, 'text') and response.text:
+                  text = response.text
+              else:
+                  for part in getattr(response, 'parts', []) or []:
+                      text_part = getattr(part, 'text', None)
+                      if text_part:
+                          text += text_part
+              entry['translated'] = text.strip()
 
-          text = ''
-          if hasattr(response, 'text') and response.text:
-              text = response.text
-          else:
-              for part in getattr(response, 'parts', []) or []:
-                  text_part = getattr(part, 'text', None)
-                  if text_part:
-                      text += text_part
-
-          text = text.strip()
-          if not text:
-              print('Gemini からテキストレスポンスが得られませんでした', file=sys.stderr)
-              sys.exit(1)
+          translated_json = json.dumps(entries, ensure_ascii=False)
+          translated_b64 = base64.b64encode(translated_json.encode('utf-8')).decode('ascii')
 
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
-              fh.write('translated<<EOF\n')
-              fh.write(text)
-              fh.write('\nEOF\n')
+              fh.write(f'translated_b64={translated_b64}\n')
           PY
 
       - name: Mattermostメッセージ生成
@@ -672,85 +770,121 @@ jobs:
         id: message
         env:
           TARGET_REPO: ${{ env.TARGET_REPO }}
-          RELEASE_TAG: ${{ steps.fetch.outputs.tag }}
-          RELEASE_NAME: ${{ steps.fetch.outputs.name }}
-          RELEASE_URL: ${{ steps.fetch.outputs.url }}
-          RELEASE_CONTENT: ${{ steps.content.outputs.content }}
-          CONTENT_SOURCE: ${{ steps.content.outputs.source }}
-          TRANSLATED_BODY: ${{ steps.translate.outputs.translated }}
+          TRANSLATED_B64: ${{ steps.translate.outputs.translated_b64 }}
         run: |
           python <<'PY'
+          import base64
           import json
           import os
 
           def truncate(text, limit=1800):
+              text = text.strip()
               if len(text) <= limit:
                   return text
               return text[:limit].rstrip() + '\n...'
 
-          target_repo = os.environ['TARGET_REPO']
-          release_tag = os.environ.get('RELEASE_TAG', 'unknown')
-          release_name = os.environ.get('RELEASE_NAME') or release_tag
-          release_url = os.environ.get('RELEASE_URL', '')
-          translated = os.environ.get('TRANSLATED_BODY') or ''
-          release_content = os.environ.get('RELEASE_CONTENT') or ''
-          source_key = os.environ.get('CONTENT_SOURCE') or ''
+          translated_b64 = os.environ.get('TRANSLATED_B64', '') or ''
+          try:
+              entries = json.loads(base64.b64decode(translated_b64).decode('utf-8'))
+          except Exception:
+              entries = []
 
-          lines = [
-              f"Release `{release_tag}` detected for *{target_repo}*",
-              f"Title: {release_name}",
-              f"URL: {release_url}",
-          ]
+          target_repo = os.environ.get('TARGET_REPO', '')
 
-          def describe_source(key):
-              if not key or key == 'none':
-                  return None
-              if key == 'release':
-                  return '情報ソース: GitHub Release'
-              if key.startswith('changelog:'):
-                  return f"情報ソース: {key.split(':', 1)[1]}"
-              if key.startswith('npm:'):
-                  return f"情報ソース: npm {key.split(':', 1)[1]}"
-              return f"情報ソース: {key}"
+          payloads = []
+          for entry in entries:
+              tag = entry.get('tag', 'unknown')
+              release_name = entry.get('name') or tag
+              url = entry.get('url', '')
+              translated = (entry.get('translated') or '').strip()
+              content = entry.get('content') or ''
+              source_key = entry.get('source') or ''
 
-          source_line = describe_source(source_key)
-          if source_line:
-              lines.append(source_line)
+              lines = [
+                  f"Release `{tag}` detected for *{target_repo}*",
+                  f"Title: {release_name}",
+                  f"URL: {url}",
+              ]
 
-          translated = translated.strip()
-          if translated:
-              lines.append('')
-              lines.append('リリースノート')
-              lines.append('```markdown')
-              lines.append(translated)
-              lines.append('```')
-          else:
-              fallback = truncate(release_content.strip())
-              if fallback:
+              def describe_source(key):
+                  if not key or key == 'none':
+                      return None
+                  if key == 'release':
+                      return '情報ソース: GitHub Release'
+                  if key.startswith('changelog:'):
+                      return f"情報ソース: {key.split(':', 1)[1]}"
+                  if key.startswith('npm:'):
+                      return f"情報ソース: npm {key.split(':', 1)[1]}"
+                  return f"情報ソース: {key}"
+
+              source_line = describe_source(source_key)
+              if source_line:
+                  lines.append(source_line)
+
+              body_block = translated if translated else truncate(content)
+              if body_block:
+                  label = 'リリースノート' if translated else '原文'
                   lines.append('')
-                  lines.append('原文')
+                  lines.append(label)
                   lines.append('```markdown')
-                  lines.append(fallback)
+                  lines.append(body_block)
                   lines.append('```')
               else:
                   lines.append('')
                   lines.append('リリースノート情報を取得できませんでした。')
 
-          payload = json.dumps({"text": '\n'.join(lines)})
+              payloads.append(json.dumps({'text': '\n'.join(lines)}, ensure_ascii=False))
+
+          payloads_json = json.dumps(payloads, ensure_ascii=False)
+          payloads_b64 = base64.b64encode(payloads_json.encode('utf-8')).decode('ascii')
 
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
-              fh.write('payload<<EOF\n')
-              fh.write(payload)
-              fh.write('\nEOF\n')
+              fh.write(f'payloads_b64={payloads_b64}\n')
+              fh.write(f'payload_count={len(payloads)}\n')
           PY
 
       - name: Mattermostへ送信
         if: steps.compare.outputs.changed == 'true'
+        env:
+          MATTERMOST_WEBHOOK_URL: ${{ env.MATTERMOST_WEBHOOK_URL }}
+          PAYLOADS_B64: ${{ steps.message.outputs.payloads_b64 }}
         run: |
-          curl -sS -X POST \
-            -H 'Content-Type: application/json' \
-            -d '${{ steps.message.outputs.payload }}' \
-            "$MATTERMOST_WEBHOOK_URL"
+          set -euo pipefail
+          python <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          webhook = os.environ.get('MATTERMOST_WEBHOOK_URL')
+          if not webhook:
+              print('MATTERMOST_WEBHOOK_URL is missing', file=sys.stderr)
+              sys.exit(1)
+
+          payloads_b64 = os.environ.get('PAYLOADS_B64', '') or ''
+          try:
+              payloads = json.loads(base64.b64decode(payloads_b64).decode('utf-8'))
+          except Exception:
+              payloads = []
+
+          for payload in payloads:
+              data = payload.encode('utf-8')
+              req = urllib.request.Request(
+                  webhook,
+                  data=data,
+                  headers={'Content-Type': 'application/json'},
+              )
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      resp.read()
+              except urllib.error.HTTPError as exc:
+                  print(f'Mattermost webhook error: {exc.status} {exc.reason}', file=sys.stderr)
+                  body = exc.read().decode('utf-8', errors='replace')
+                  print(body, file=sys.stderr)
+                  raise
+          PY
 
       - name: 状態ファイル作成
         if: steps.fetch.outputs.release_found == 'true'

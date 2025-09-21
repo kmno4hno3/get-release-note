@@ -11,8 +11,9 @@
 
 1. GitHub のリポジトリ設定 (`Settings` → `Secrets and variables` → `Actions`) を開きます。
 2. `Secrets` タブに Mattermost の Incoming Webhook URL を `MATTERMOST_WEBHOOK_URL` として登録します。
-3. `Variables` タブに `TARGET_REPOSITORY` を追加し、監視したいリポジトリを `owner/name` 形式で登録します。
-   - 例: `octocat/Hello-World`
+3. `Variables` タブに `TARGET_REPOSITORIES` を追加し、監視したいリポジトリを `owner/name` 形式でカンマまたは改行区切りで登録します。
+   - 例: `octocat/Hello-World, github/docs`
+   - 1 件だけ監視する場合は従来どおり `TARGET_REPOSITORY` を設定しても動作します。
 
 ## ワークフローの動作
 
@@ -24,13 +25,13 @@
   1. GitHub API (`releases/latest`) から最新リリースを取得
   2. ワークフローアーティファクトの `state.json` から前回通知済みタグを読込
   3. 新しいタグであれば Mattermost へ整形済みメッセージを投稿
-  4. 通知後（または変更がない場合でも）最新タグを含む `state.json` を再生成し、`release-monitor-state` という名前でアーティファクトへ保存
+  4. 通知後（または変更がない場合でも）最新タグを含む `state.json` を再生成し、対象リポジトリごとに `release-monitor-state-<owner-name>` 形式のアーティファクトへ保存
 
 ## 初回実行の確認方法
 
 1. `Actions` タブから `Monitor External Release` ワークフローを開きます。
 2. `Run workflow` で手動実行し、成功後に Mattermost へ通知が届くことを確認します。
-3. `Actions` タブで該当ジョブを開き、Artifacts に `release-monitor-state` が生成されていることを確認します。アーティファクト内の `state.json` に通知済みタグが保存されます。
+3. `Actions` タブで該当ジョブを開き、Artifacts に `release-monitor-state-<owner-name>`（例: `release-monitor-state-octocat-hello-world`）が生成されていることを確認します。アーティファクト内の `state.json` に通知済みタグが保存されます。
 
 ## カスタマイズ
 

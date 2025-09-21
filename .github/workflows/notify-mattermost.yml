@@ -10,20 +10,84 @@ permissions:
   actions: write
 
 env:
-  TARGET_REPO: ${{ vars.TARGET_REPOSITORY }}
+  TARGET_REPOSITORIES: ${{ vars.TARGET_REPOSITORIES }}
+  TARGET_REPOSITORY: ${{ vars.TARGET_REPOSITORY }}
   MATTERMOST_WEBHOOK_URL: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
-  STATE_ARTIFACT_NAME: release-monitor-state
+  STATE_ARTIFACT_PREFIX: release-monitor-state
   STATE_FILE: state.json
 
 jobs:
-  watch-release:
+  prepare-targets:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+    steps:
+      - name: リポジトリリスト生成
+        id: prepare
+        env:
+          TARGET_REPOSITORIES: ${{ env.TARGET_REPOSITORIES }}
+          TARGET_REPOSITORY: ${{ env.TARGET_REPOSITORY }}
+          STATE_ARTIFACT_PREFIX: ${{ env.STATE_ARTIFACT_PREFIX }}
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          def normalize_list(raw):
+              values = []
+              if not raw:
+                  return values
+              for part in re.split(r'[\s,]+', raw):
+                  part = part.strip()
+                  if part:
+                      values.append(part)
+              return values
+
+          targets = []
+          seen = set()
+          prefix = os.environ.get("STATE_ARTIFACT_PREFIX", "release-monitor-state")
+          for source in (
+              os.environ.get("TARGET_REPOSITORIES") or "",
+              os.environ.get("TARGET_REPOSITORY") or "",
+          ):
+              for repo in normalize_list(source):
+                  if repo in seen:
+                      continue
+                  seen.add(repo)
+                  slug = re.sub(r'[^0-9A-Za-z_.-]+', '-', repo).strip("-")
+                  slug = slug.lower() or "default"
+                  targets.append({
+                      "repo": repo,
+                      "artifact": f"{prefix}-{slug}",
+                  })
+
+          if not targets:
+              print("TARGET_REPOSITORIES または TARGET_REPOSITORY が未設定です", file=sys.stderr)
+              sys.exit(1)
+
+          matrix = json.dumps(targets)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"matrix={matrix}\n")
+          print(f"Monitoring {len(targets)} repositories: {[t['repo'] for t in targets]}")
+          PY
+
+  watch-release:
+    needs: prepare-targets
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: ${{ fromJSON(needs.prepare-targets.outputs.matrix) }}
+    env:
+      TARGET_REPO: ${{ matrix.target.repo }}
+      STATE_ARTIFACT_NAME: ${{ matrix.target.artifact }}
     steps:
       - name: 設定検証
         run: |
           set -euo pipefail
           if [ -z "$TARGET_REPO" ]; then
-            echo "Vars.TARGET_REPOSITORY が未設定です" >&2
+            echo "リポジトリが未設定です" >&2
             exit 1
           fi
           if [ -z "$MATTERMOST_WEBHOOK_URL" ]; then

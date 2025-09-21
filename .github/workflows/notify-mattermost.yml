@@ -220,8 +220,8 @@ jobs:
             exit 0
           fi
           cat <<'EOF' > prompt.txt
-Translate the following GitHub release notes into Japanese. Preserve Markdown formatting, keep code fences, and conclude with a Japanese bullet list summarizing the key updates.
-EOF
+          Translate the following GitHub release notes into Japanese. Preserve Markdown formatting, keep code fences, and conclude with a Japanese bullet list summarizing the key updates.
+          EOF
           printf '\n-----\n%s\n' "$body" >> prompt.txt
           export GOOGLE_API_KEY="$GEMINI_API_KEY"
           model="${GEMINI_MODEL:-gemini-1.5-flash}"

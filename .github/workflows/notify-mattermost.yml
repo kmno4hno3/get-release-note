@@ -267,18 +267,13 @@ jobs:
                   value = value or ''
                   if key == 'body':
                       if value:
-                          fh.write('body<<EOF
-')
+                          fh.write('body<<EOF\n')
                           fh.write(value)
-                          fh.write('
-EOF
-')
+                          fh.write('\nEOF\n')
                       else:
-                          fh.write('body=
-')
+                          fh.write('body=\n')
                       continue
-                  fh.write(f'{key}={value}
-')
+                  fh.write(f'{key}={value}\n')
           PY
       - name: 状態読み込み
         if: steps.fetch.outputs.release_found == 'true'

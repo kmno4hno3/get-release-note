@@ -12,7 +12,7 @@
 1. GitHub のリポジトリ設定 (`Settings` → `Secrets and variables` → `Actions`) を開きます。
 2. `Secrets` タブに以下を登録します。
    - `MATTERMOST_WEBHOOK_URL`: Mattermost の Incoming Webhook URL
-   - `GEMINI_API_KEY`: Gemini CLI が利用する API キー（Google AI Studio で発行）
+   - `GEMINI_API_KEY`: Gemini API が利用するキー（Google AI Studio で発行）
 3. `Variables` タブに `TARGET_REPOSITORIES` を追加し、監視したいリポジトリを `owner/name` 形式でカンマまたは改行区切りで登録します。
    - 例: `octocat/Hello-World, github/docs`
    - 1 件だけ監視する場合は従来どおり `TARGET_REPOSITORY` を設定しても動作します。
@@ -27,7 +27,7 @@
 - フロー:
   1. GitHub API (`releases/latest`) から最新リリースを取得
   2. ワークフローアーティファクトの `state.json` から前回通知済みタグを読込
-  3. 新しいタグであれば Gemini CLI を用いてリリースノート本文を日本語に翻訳し、要約付きテキストを得る
+  3. 新しいタグであれば Gemini を用いてリリースノート本文を日本語に翻訳し、要約付きテキストを得る
   4. 翻訳結果と原文を含むメッセージを Mattermost へ投稿
   5. 通知後（または変更がない場合でも）最新タグを含む `state.json` を再生成し、対象リポジトリごとに `release-monitor-state-<owner-name>` 形式のアーティファクトへ保存
 
@@ -41,5 +41,5 @@
 
 - ポーリング頻度を変更する場合は、ワークフロー内 `schedule` セクションの cron 式を調整してください。
 - 通知文面を変更したい場合は、`Mattermostメッセージ生成` ステップの Python スクリプトを編集します。
-- 翻訳のスタイルを調整したい場合は、`リリースノート翻訳 (Gemini CLI)` ステップ内のプロンプトや `GEMINI_MODEL` の値を変更してください。
+- 翻訳のスタイルを調整したい場合は、`リリースノート翻訳 (Gemini)` ステップ内のプロンプトや `GEMINI_MODEL` の値を変更してください。
 - Mattermost の投稿先チャンネルを個別指定したい場合は、ペイロードに `"channel": "チャンネル名"` を追加してください（Webhook 設定で許可されている場合のみ有効）。

@@ -199,7 +199,7 @@ jobs:
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: リリースノート翻訳 (Gemini CLI)
+      - name: リリースノート翻訳 (Gemini)
         if: steps.compare.outputs.changed == 'true'
         id: translate
         env:
@@ -213,26 +213,71 @@ jobs:
             exit 1
           fi
           python3 -m pip install --upgrade --quiet google-genai
-          export PATH="$HOME/.local/bin:$PATH"
           body="${RELEASE_BODY:-}"
           if [ -z "$body" ]; then
             echo "translated=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          cat <<'EOF' > prompt.txt
-          Translate the following GitHub release notes into Japanese. Preserve Markdown formatting, keep code fences, and conclude with a Japanese bullet list summarizing the key updates.
-          EOF
-          printf '\n-----\n%s\n' "$body" >> prompt.txt
-          export GOOGLE_API_KEY="$GEMINI_API_KEY"
-          model="${GEMINI_MODEL:-gemini-1.5-flash}"
-          genai prompt --model "$model" --input-file prompt.txt --output text > translation.txt
-          if [ ! -s translation.txt ]; then
-            echo "Gemini CLI から翻訳結果が取得できませんでした" >&2
-            exit 1
-          fi
-          translation=$(cat translation.txt)
-          printf 'translated<<EOF\n%s\nEOF\n' "$translation" >> "$GITHUB_OUTPUT"
-          rm -f prompt.txt translation.txt
+          python <<'PY'
+          import os
+          import sys
+          import textwrap
+
+          body = os.environ.get('RELEASE_BODY', '')
+          if not body.strip():
+              with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+                  fh.write('translated=\n')
+              sys.exit(0)
+
+          api_key = os.environ.get('GEMINI_API_KEY')
+          if not api_key:
+              print('Gemini API key is missing', file=sys.stderr)
+              sys.exit(1)
+
+          model_name = os.environ.get('GEMINI_MODEL') or 'gemini-1.5-flash'
+
+          try:
+              import google.genai as genai
+          except ImportError as exc:
+              print(f'google.genai import failed: {exc}', file=sys.stderr)
+              sys.exit(1)
+
+          genai.configure(api_key=api_key)
+          prompt = textwrap.dedent(
+              """
+              Translate the following GitHub release notes into Japanese. Preserve Markdown formatting, keep code fences, and conclude with a Japanese bullet list summarizing the key updates.
+
+              -----
+              {body}
+              """
+          ).format(body=body)
+
+          try:
+              model = genai.GenerativeModel(model_name)
+              response = model.generate_content(prompt)
+          except Exception as exc:
+              print(f'Gemini generate_content failed: {exc}', file=sys.stderr)
+              sys.exit(1)
+
+          text = ''
+          if hasattr(response, 'text') and response.text:
+              text = response.text
+          else:
+              for part in getattr(response, 'parts', []) or []:
+                  text_part = getattr(part, 'text', None)
+                  if text_part:
+                      text += text_part
+
+          text = text.strip()
+          if not text:
+              print('Gemini からテキストレスポンスが得られませんでした', file=sys.stderr)
+              sys.exit(1)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write('translated<<EOF\n')
+              fh.write(text)
+              fh.write('\nEOF\n')
+          PY
 
       - name: Mattermostメッセージ生成
         if: steps.compare.outputs.changed == 'true'

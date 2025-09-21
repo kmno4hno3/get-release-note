@@ -736,8 +736,22 @@ jobs:
                   continue
               prompt = textwrap.dedent(
                   """
-                  Translate the following release note content into Japanese. Preserve Markdown formatting, keep code fences, and conclude with a Japanese bullet list summarizing the key updates.
+                  あなたはリリースノートを日本語に翻訳するアシスタントです。次のテンプレートに従い、プレーンテキストで出力してください（コードフェンス禁止）。
 
+                  リリースノート
+
+                  新機能
+                  <新機能があれば箇条書きで記載。なければ「該当なし」と書く。>
+
+                  マージされたPR:
+                  <関連するPR番号と要約を箇条書きで記載。情報が無ければ「情報なし」と書く。>
+
+                  主な更新点:
+                  <3〜5行程度で日本語の要約を記載。必要なら箇条書きを使用。>
+
+                  各セクションでは角括弧付きの指示文を出力せず、実際の内容もしくは指定された定型文だけを記載してください。
+
+                  入力テキスト:
                   -----
                   {body}
                   """
@@ -821,17 +835,19 @@ jobs:
               if source_line:
                   lines.append(source_line)
 
-              body_block = translated if translated else truncate(content)
-              if body_block:
-                  label = 'リリースノート' if translated else '原文'
+              if translated:
                   lines.append('')
-                  lines.append(label)
-                  lines.append('```markdown')
-                  lines.append(body_block)
-                  lines.append('```')
+                  lines.extend(translated.splitlines())
               else:
-                  lines.append('')
-                  lines.append('リリースノート情報を取得できませんでした。')
+                  fallback = truncate(content)
+                  if fallback:
+                      lines.append('')
+                      lines.append('リリースノート')
+                      lines.append('')
+                      lines.append(fallback)
+                  else:
+                      lines.append('')
+                      lines.append('リリースノート情報を取得できませんでした。')
 
               payloads.append(json.dumps({'text': '\n'.join(lines)}, ensure_ascii=False))
 
@@ -869,6 +885,10 @@ jobs:
           except Exception:
               payloads = []
 
+          if not payloads:
+              print('No payload to send', file=sys.stderr)
+              sys.exit(0)
+
           for payload in payloads:
               data = payload.encode('utf-8')
               req = urllib.request.Request(
@@ -891,7 +911,7 @@ jobs:
         env:
           STATE_FILE: ${{ env.STATE_FILE }}
           LAST_TAG: ${{ steps.state.outputs.last_tag }}
-          LATEST_TAG: ${{ steps.fetch.outputs.tag }}
+          LATEST_TAG: ${{ steps.filter.outputs.latest_tag }}
           CHANGED: ${{ steps.compare.outputs.changed }}
         run: |
           set -euo pipefail

@@ -199,11 +199,224 @@ jobs:
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: リリースノート
+      - name: リリースノート収集
+        if: steps.compare.outputs.changed == 'true'
+        id: content
+        env:
+          TARGET_REPO: ${{ env.TARGET_REPO }}
+          RELEASE_TAG: ${{ steps.fetch.outputs.tag }}
+          RELEASE_BODY: ${{ steps.fetch.outputs.body }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.error
+          import urllib.request
+
+          def log(msg):
+              print(msg, file=sys.stderr)
+
+          release_body = os.environ.get('RELEASE_BODY', '') or ''
+          target_repo = os.environ.get('TARGET_REPO', '')
+          tag = os.environ.get('RELEASE_TAG', '')
+          token = os.environ.get('GITHUB_TOKEN', '')
+
+          content = release_body.strip()
+          source = 'release' if content else ''
+
+          def build_candidates(tag_value):
+              values = []
+              if not tag_value:
+                  return values
+              values.append(tag_value)
+              tail = tag_value.split('/')[-1]
+              values.append(tail)
+              if tail.startswith('v'):
+                  values.append(tail[1:])
+              if tag_value.startswith('v'):
+                  values.append(tag_value[1:])
+              match = re.search(r'(\d+\.\d+(?:\.\d+)*)', tag_value)
+              if match:
+                  values.append(match.group(1))
+              normed = []
+              seen = set()
+              for item in values:
+                  normalized = item.lower()
+                  if normalized and normalized not in seen:
+                      normed.append(item)
+                      seen.add(normalized)
+              return normed
+
+          candidates = build_candidates(tag)
+
+          def extract_section(text):
+              if not text.strip():
+                  return ''
+              lines = text.splitlines()
+              fallback_idx = None
+              for idx, line in enumerate(lines):
+                  m = re.match(r'^\s*(#{1,6})\s+(.*)$', line)
+                  if not m:
+                      continue
+                  level = len(m.group(1))
+                  heading_text = re.sub(r'[\[\]()]', '', m.group(2))
+                  heading_norm = re.sub(r'\s+', ' ', heading_text).lower()
+                  if any(c.lower() in heading_norm for c in candidates):
+                      start = idx + 1
+                      end = len(lines)
+                      for j in range(start, len(lines)):
+                          m2 = re.match(r'^\s*(#{1,6})\s+', lines[j])
+                          if m2 and len(m2.group(1)) <= level:
+                              end = j
+                              break
+                      section = '\n'.join(lines[start:end]).strip()
+                      if section:
+                          return section
+                      fallback_idx = idx
+              if fallback_idx is not None:
+                  start = fallback_idx + 1
+                  excerpt = '\n'.join(lines[start:start + 40]).strip()
+                  if excerpt:
+                      return excerpt
+              trimmed = text.strip()
+              if len(trimmed) > 4000:
+                  return trimmed[:4000].rstrip() + '\n...'
+              return trimmed
+
+          def fetch_changelog():
+              if not target_repo or not tag:
+                  return None, None
+              paths = [
+                  'CHANGELOG.md',
+                  'CHANGE.md',
+                  'docs/CHANGELOG.md',
+                  'docs/CHANGE.md',
+                  'CHANGELOG',
+                  'docs/CHANGELOG',
+              ]
+              for path in paths:
+                  url = f'https://api.github.com/repos/{target_repo}/contents/{path}?ref={tag}'
+                  headers = {
+                      'Accept': 'application/vnd.github.raw',
+                      'User-Agent': 'release-monitor-action',
+                  }
+                  if token:
+                      headers['Authorization'] = f'Bearer {token}'
+                  req = urllib.request.Request(url, headers=headers)
+                  try:
+                      with urllib.request.urlopen(req) as resp:
+                          data = resp.read().decode('utf-8', errors='replace')
+                  except urllib.error.HTTPError as exc:
+                      if exc.code not in (403, 404):
+                          log(f'GitHub API error for {path}: {exc}')
+                      if exc.code == 403 and not token:
+                          log('GitHub API rate limited and no token provided.')
+                      continue
+                  except Exception as exc:
+                      log(f'Failed to fetch {path}: {exc}')
+                      continue
+                  section = extract_section(data)
+                  if section:
+                      return section, f'changelog:{path}'
+                  trimmed = data.strip()
+                  if trimmed:
+                      if len(trimmed) > 4000:
+                          trimmed = trimmed[:4000].rstrip() + '\n...'
+                      return trimmed, f'changelog:{path}'
+              return None, None
+
+          def fetch_npm():
+              package = os.environ.get('NPM_PACKAGE') or ''
+              if not package:
+                  if target_repo and '/' in target_repo:
+                      package = target_repo.split('/')[-1]
+              if not package:
+                  return None, None
+              version = ''
+              if tag:
+                  version = tag.lstrip('v')
+                  match = re.search(r'(\d+\.\d+(?:\.\d+)*)', tag)
+                  if match:
+                      version = match.group(1)
+              if not version:
+                  return None, None
+              try:
+                  proc = subprocess.run(
+                      ['npm', 'view', f'{package}@{version}', '--json'],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      text=True,
+                      check=True,
+                  )
+              except subprocess.CalledProcessError as exc:
+                  log(f'npm view failed: {exc.stderr.strip() or exc.stdout.strip() or exc}')
+                  return None, None
+              raw = proc.stdout.strip()
+              if not raw or raw in ('null', 'undefined'):
+                  return None, None
+              try:
+                  data = json.loads(raw)
+              except json.JSONDecodeError as exc:
+                  log(f'Failed to parse npm output: {exc}')
+                  return None, None
+              if isinstance(data, list):
+                  data = data[0] if data else {}
+              parts = []
+              description = data.get('description')
+              if description:
+                  parts.append(description.strip())
+              release_notes = data.get('releaseNotes') or data.get('changelog')
+              if release_notes:
+                  parts.append(str(release_notes).strip())
+              readme = data.get('readme')
+              if readme:
+                  section = extract_section(readme)
+                  if section:
+                      parts.append(section)
+              time_info = data.get('time') or {}
+              published_at = time_info.get(version)
+              if published_at:
+                  parts.append(f'Published on npm: {published_at}')
+              homepage = data.get('homepage')
+              if homepage:
+                  parts.append(f'Homepage: {homepage}')
+              if not parts:
+                  return None, None
+              text = '\n\n'.join(part for part in parts if part).strip()
+              if len(text) > 4000:
+                  text = text[:4000].rstrip() + '\n...'
+              return text, f'npm:{package}@{version}'
+
+          if not content:
+              changelog_text, changelog_source = fetch_changelog()
+              if changelog_text:
+                  content = changelog_text.strip()
+                  source = changelog_source or 'changelog'
+          if not content:
+              npm_text, npm_source = fetch_npm()
+              if npm_text:
+                  content = npm_text.strip()
+                  source = npm_source or 'npm'
+          if not content:
+              source = source or 'none'
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write('content<<EOF\n')
+              fh.write(content)
+              fh.write('\nEOF\n')
+              fh.write(f'source={source}\n')
+          PY
+
+      - name: リリースノート翻訳
         if: steps.compare.outputs.changed == 'true'
         id: translate
         env:
-          RELEASE_BODY: ${{ steps.fetch.outputs.body }}
+          RELEASE_TEXT: ${{ steps.content.outputs.content }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ env.GEMINI_MODEL }}
         run: |
@@ -213,7 +426,7 @@ jobs:
             exit 1
           fi
           python3 -m pip install --upgrade --quiet google-generativeai
-          body="${RELEASE_BODY:-}"
+          body="${RELEASE_TEXT:-}"
           if [ -z "$body" ]; then
             echo "translated=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -223,7 +436,7 @@ jobs:
           import sys
           import textwrap
 
-          body = os.environ.get('RELEASE_BODY', '')
+          body = os.environ.get('RELEASE_TEXT', '')
           if not body.strip():
               with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
                   fh.write('translated=\n')
@@ -245,7 +458,7 @@ jobs:
           genai.configure(api_key=api_key)
           prompt = textwrap.dedent(
               """
-              Translate the following GitHub release notes into Japanese. Preserve Markdown formatting, keep code fences, and conclude with a Japanese bullet list summarizing the key updates.
+              Translate the following release note content into Japanese. Preserve Markdown formatting, keep code fences, and conclude with a Japanese bullet list summarizing the key updates.
 
               -----
               {body}
@@ -287,19 +500,26 @@ jobs:
           RELEASE_TAG: ${{ steps.fetch.outputs.tag }}
           RELEASE_NAME: ${{ steps.fetch.outputs.name }}
           RELEASE_URL: ${{ steps.fetch.outputs.url }}
-          RELEASE_BODY: ${{ steps.fetch.outputs.body }}
+          RELEASE_CONTENT: ${{ steps.content.outputs.content }}
+          CONTENT_SOURCE: ${{ steps.content.outputs.source }}
           TRANSLATED_BODY: ${{ steps.translate.outputs.translated }}
         run: |
           python <<'PY'
           import json
           import os
 
+          def truncate(text, limit=1800):
+              if len(text) <= limit:
+                  return text
+              return text[:limit].rstrip() + '\n...'
+
           target_repo = os.environ['TARGET_REPO']
           release_tag = os.environ.get('RELEASE_TAG', 'unknown')
           release_name = os.environ.get('RELEASE_NAME') or release_tag
           release_url = os.environ.get('RELEASE_URL', '')
-          release_body = os.environ.get('RELEASE_BODY') or ''
           translated = os.environ.get('TRANSLATED_BODY') or ''
+          release_content = os.environ.get('RELEASE_CONTENT') or ''
+          source_key = os.environ.get('CONTENT_SOURCE') or ''
 
           lines = [
               f"Release `{release_tag}` detected for *{target_repo}*",
@@ -307,12 +527,39 @@ jobs:
               f"URL: {release_url}",
           ]
 
-          if translated.strip():
+          def describe_source(key):
+              if not key or key == 'none':
+                  return None
+              if key == 'release':
+                  return '情報ソース: GitHub Release'
+              if key.startswith('changelog:'):
+                  return f"情報ソース: {key.split(':', 1)[1]}"
+              if key.startswith('npm:'):
+                  return f"情報ソース: npm {key.split(':', 1)[1]}"
+              return f"情報ソース: {key}"
+
+          source_line = describe_source(source_key)
+          if source_line:
+              lines.append(source_line)
+
+          translated = translated.strip()
+          if translated:
               lines.append('')
               lines.append('リリースノート')
               lines.append('```markdown')
               lines.append(translated)
               lines.append('```')
+          else:
+              fallback = truncate(release_content.strip())
+              if fallback:
+                  lines.append('')
+                  lines.append('原文')
+                  lines.append('```markdown')
+                  lines.append(fallback)
+                  lines.append('```')
+              else:
+                  lines.append('')
+                  lines.append('リリースノート情報を取得できませんでした。')
 
           payload = json.dumps({"text": '\n'.join(lines)})
 

@@ -212,7 +212,7 @@ jobs:
             echo "Secrets.GEMINI_API_KEY が未設定です" >&2
             exit 1
           fi
-          python3 -m pip install --upgrade --quiet google-genai
+          python3 -m pip install --upgrade --quiet google-generativeai
           body="${RELEASE_BODY:-}"
           if [ -z "$body" ]; then
             echo "translated=" >> "$GITHUB_OUTPUT"
@@ -237,9 +237,9 @@ jobs:
           model_name = os.environ.get('GEMINI_MODEL') or 'gemini-1.5-flash'
 
           try:
-              import google.genai as genai
+              import google.generativeai as genai
           except ImportError as exc:
-              print(f'google.genai import failed: {exc}', file=sys.stderr)
+              print(f'google.generativeai import failed: {exc}', file=sys.stderr)
               sys.exit(1)
 
           genai.configure(api_key=api_key)
@@ -309,7 +309,7 @@ jobs:
 
           if translated.strip():
               lines.append('')
-              lines.append('翻訳済みリリースノート (Gemini CLI)')
+              lines.append('翻訳済みリリースノート (Gemini API)')
               lines.append('```markdown')
               lines.append(translated)
               lines.append('```')

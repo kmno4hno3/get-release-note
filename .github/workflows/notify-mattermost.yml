@@ -199,7 +199,7 @@ jobs:
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: リリースノート翻訳 (Gemini)
+      - name: リリースノート
         if: steps.compare.outputs.changed == 'true'
         id: translate
         env:
@@ -302,23 +302,16 @@ jobs:
           translated = os.environ.get('TRANSLATED_BODY') or ''
 
           lines = [
-              f"External release `{release_tag}` detected for *{target_repo}*",
+              f"Release `{release_tag}` detected for *{target_repo}*",
               f"Title: {release_name}",
               f"URL: {release_url}",
           ]
 
           if translated.strip():
               lines.append('')
-              lines.append('翻訳済みリリースノート (Gemini API)')
+              lines.append('リリースノート')
               lines.append('```markdown')
               lines.append(translated)
-              lines.append('```')
-
-          if release_body.strip():
-              lines.append('')
-              lines.append('原文リリースノート')
-              lines.append('```markdown')
-              lines.append(release_body)
               lines.append('```')
 
           payload = json.dumps({"text": '\n'.join(lines)})

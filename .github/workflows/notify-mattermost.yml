@@ -168,6 +168,7 @@ jobs:
                   'fallback_branch': '',
                   'fallback_path': '',
                   'published_at': release.get('published_at') or '',
+                  'has_body': bool((release.get('body') or '').strip()),
               })
 
           def add_tag_entry(tag_entry):
@@ -189,6 +190,7 @@ jobs:
                   'fallback_branch': default_branch,
                   'fallback_path': '',
                   'published_at': '',
+                  'has_body': False,
               })
 
           def add_changelog_entry(path, commit):
@@ -207,6 +209,7 @@ jobs:
                   'fallback_branch': default_branch,
                   'fallback_path': path,
                   'published_at': commit.get('commit', {}).get('author', {}).get('date', ''),
+                  'has_body': False,
               })
 
           status, data = request(f'https://api.github.com/repos/{repo}/releases?per_page=20')
@@ -652,6 +655,7 @@ jobs:
           for entry in entries:
               reference_kind = (entry.get('reference_kind') or '').lower()
               release_body = (entry.get('body') or '').strip()
+              has_body = entry.get('has_body', False)
               content = release_body
               source = 'release' if release_body else ''
               candidates = build_candidates(entry.get('tag') or '')
@@ -669,12 +673,12 @@ jobs:
                   return None, None
 
               if reference_kind == 'release':
-                  if not content:
+                  if not content and not has_body:
                       changelog_text, changelog_source = load_changelog()
                       if changelog_text:
                           content = changelog_text
                           source = changelog_source
-                  if not content:
+                  if not content and not has_body:
                       npm_text, npm_source = load_npm()
                       if npm_text:
                           content = npm_text

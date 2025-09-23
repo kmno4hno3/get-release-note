@@ -1,45 +1,20 @@
-# 外部リポジトリのリリース監視通知
+# get-release-note
 
-このリポジトリの GitHub Actions ワークフローは、指定した外部 GitHub リポジトリの最新リリースを定期的にポーリングし、新しいリリースを検出した場合に Mattermost へ通知します。通知済みのタグはワークフローアーティファクトとして保存するため、Issue や追加トークンは不要です。
+## monitor-releases.ts
+`scripts/monitor-releases.ts` は対象リポジトリの最新リリースを取得し、Mattermost の Incoming Webhook に通知するスクリプトです。
 
-## 前提条件
+### 事前準備
+- `MATTERMOST_WEBHOOK_URL` : 通知先の Webhook URL（必須）
+- `TARGET_REPOSITORIES` または `TARGET_REPOSITORY` : 監視対象リポジトリ（`owner/name` 形式、複数指定はスペース/カンマ区切り）
+- `GITHUB_TOKEN` : GitHub API 呼び出し用のトークン（オプション）
+- `GEMINI_API_KEY`, `GEMINI_MODEL` : Gemini での翻訳を有効化したい場合に設定
+- `NPM_PACKAGE` : npm のパッケージ名を明示的に指定する場合に設定
+- `STATE_DIR` : リリース確認済みタグを保存するディレクトリ（未指定時は `release-monitor-state/state.json`）
 
-- 通知先チャンネルで Incoming Webhook URL を取得済みであること
-- 監視対象の GitHub リポジトリ名（`owner/name` 形式）を把握していること
+### 実行例
+```bash
+pnpm install
+npx ts-node scripts/monitor-releases.ts
+```
 
-## 設定手順
-
-1. GitHub のリポジトリ設定 (`Settings` → `Secrets and variables` → `Actions`) を開きます。
-2. `Secrets` タブに以下を登録します。
-   - `MATTERMOST_WEBHOOK_URL`: Mattermost の Incoming Webhook URL
-   - `GEMINI_API_KEY`: Gemini API が利用するキー（Google AI Studio で発行）
-3. `Variables` タブに `TARGET_REPOSITORIES` を追加し、監視したいリポジトリを `owner/name` 形式でカンマまたは改行区切りで登録します。
-   - 例: `octocat/Hello-World, github/docs`
-   - 1 件だけ監視する場合は従来どおり `TARGET_REPOSITORY` を設定しても動作します。
-   - Gemini モデルを変更したい場合は `GEMINI_MODEL`（例: `gemini-1.5-pro`）を Variables に追加します。
-
-## ワークフローの動作
-
-- ワークフロー定義: `.github/workflows/notify-mattermost.yml`
-- トリガー:
-  - 毎時 0 分 (`cron: '0 * * * *'`)
-  - `workflow_dispatch` による手動実行
-- フロー:
-  1. GitHub API (`releases/latest`) から最新リリースを取得
-  2. ワークフローアーティファクトの `state.json` から前回通知済みタグを読込
-  3. 新しいタグであれば Gemini を用いてリリースノート本文を日本語に翻訳し、要約付きテキストを得る
-  4. 翻訳結果と原文を含むメッセージを Mattermost へ投稿
-  5. 通知後（または変更がない場合でも）最新タグを含む `state.json` を再生成し、対象リポジトリごとに `release-monitor-state-<owner-name>` 形式のアーティファクトへ保存
-
-## 初回実行の確認方法
-
-1. `Actions` タブから `Monitor External Release` ワークフローを開きます。
-2. `Run workflow` で手動実行し、成功後に Mattermost へ通知が届くことを確認します。
-3. `Actions` タブで該当ジョブを開き、Artifacts に `release-monitor-state-<owner-name>`（例: `release-monitor-state-octocat-hello-world`）が生成されていることを確認します。アーティファクト内の `state.json` に通知済みタグが保存されます。
-
-## カスタマイズ
-
-- ポーリング頻度を変更する場合は、ワークフロー内 `schedule` セクションの cron 式を調整してください。
-- 通知文面を変更したい場合は、`Mattermostメッセージ生成` ステップの Python スクリプトを編集します。
-- 翻訳のスタイルを調整したい場合は、`リリースノート翻訳 (Gemini)` ステップ内のプロンプトや `GEMINI_MODEL` の値を変更してください。
-- Mattermost の投稿先チャンネルを個別指定したい場合は、ペイロードに `"channel": "チャンネル名"` を追加してください（Webhook 設定で許可されている場合のみ有効）。
+実行後は `STATE_DIR/state.json` に既知の最新タグが保存され、次回実行時は更新分のみ通知します。

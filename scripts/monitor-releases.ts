@@ -2,10 +2,10 @@
 import "dotenv/config";
 import { execFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { GoogleGenAI } from "@google/genai";
+import * as path from "path";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,9 +30,7 @@ type PreparedPayload = {
 	source: string;
 };
 
-type StateFile = {
-	last_tag: string;
-};
+type StateStore = Record<string, string>;
 
 const CONFIG = {
 	repositories: parseList(process.env.TARGET_REPOSITORIES).concat(
@@ -46,6 +44,8 @@ const CONFIG = {
 	stateDir: process.env.STATE_DIR ?? path.resolve("release-monitor-state"),
 };
 
+const STATE_FILE_PATH = path.join(CONFIG.stateDir, "state.json");
+
 const CHANGELOG_PATHS = [
 	"CHANGELOG.md",
 	"CHANGE.md",
@@ -55,7 +55,7 @@ const CHANGELOG_PATHS = [
 	"docs/CHANGELOG",
 ];
 
-async function main(): Promise<void> {
+const main = async (): Promise<void> => {
 	if (!CONFIG.mattermostWebhook) {
 		throw new Error("MATTERMOST_WEBHOOK_URL is required.");
 	}
@@ -66,33 +66,41 @@ async function main(): Promise<void> {
 		);
 	}
 
-	await mkdir(CONFIG.stateDir, { recursive: true });
+	// await mkdir(CONFIG.stateDir, { recursive: true });
+	const state = await readStateStore(STATE_FILE_PATH);
 
 	for (const repo of repos) {
 		try {
 			console.log(`\n=== ${repo} ===`);
-			await processRepository(repo);
+			const updated = await processRepository(repo, state);
+			if (updated) {
+				await writeStateStore(STATE_FILE_PATH, state);
+			}
 		} catch (error) {
 			console.error(`[${repo}] Failed:`, error);
 		}
 	}
-}
 
-async function processRepository(repo: string): Promise<void> {
+	await writeStateStore(STATE_FILE_PATH, state);
+};
+
+const processRepository = async (
+	repo: string,
+	state: StateStore,
+): Promise<boolean> => {
 	const slug = slugify(repo);
-	const statePath = path.join(CONFIG.stateDir, `${slug}.json`);
-	const lastTag = await readState(statePath);
+	const lastTag = state[slug] ?? "";
 
 	const entries = await fetchCandidateEntries(repo, CONFIG.githubToken);
 	if (entries.length === 0) {
 		console.log(`[${repo}] No releases/tags found.`);
-		return;
+		return false;
 	}
 
 	const newEntries = selectNewEntries(entries, lastTag);
 	if (newEntries.length === 0) {
 		console.log(`[${repo}] No updates since ${lastTag || "N/A"}.`);
-		return;
+		return false;
 	}
 
 	console.log(`[${repo}] ${newEntries.length} new release entries detected.`);
@@ -100,8 +108,8 @@ async function processRepository(repo: string): Promise<void> {
 	const prepared: PreparedPayload[] = [];
 	for (const entry of newEntries) {
 		const { content, source } = await resolveContent(repo, entry);
-		const translated = await translateIfNeeded(entry, content);
-		prepared.push({ entry, content, translated, source });
+		// const translated = await translateIfNeeded(entry, content);
+		// prepared.push({ entry, content, translated, source });
 	}
 
 	for (const payload of prepared) {
@@ -110,9 +118,18 @@ async function processRepository(repo: string): Promise<void> {
 	}
 
 	const newestTag = entries[0]?.tag ?? lastTag;
-	await writeState(statePath, newestTag);
-	console.log(`[${repo}] State updated: last_tag=${newestTag}`);
-}
+	let stateUpdated = false;
+	if (newestTag) {
+		stateUpdated = newestTag !== lastTag;
+		state[slug] = newestTag;
+	} else if (lastTag) {
+		delete state[slug];
+		stateUpdated = true;
+	}
+
+	console.log(`[${repo}] State updated: last_tag=${newestTag || ""}`);
+	return stateUpdated;
+};
 
 function parseList(raw?: string): string[] {
 	if (!raw) return [];
@@ -122,37 +139,44 @@ function parseList(raw?: string): string[] {
 		.filter(Boolean);
 }
 
-function dedupe(list: string[]): string[] {
+const dedupe = (list: string[]): string[] => {
 	return [...new Set(list.map((s) => s.toLowerCase()))];
-}
+};
 
-function slugify(repo: string): string {
+const slugify = (repo: string): string => {
 	return repo
 		.replace(/[^0-9a-z_.-]+/gi, "-")
 		.replace(/^-+|-+$/g, "")
 		.toLowerCase();
-}
+};
 
-async function readState(statePath: string): Promise<string> {
+const readStateStore = async (filePath: string): Promise<StateStore> => {
 	try {
-		await access(statePath, fsConstants.R_OK);
-		const raw = await readFile(statePath, "utf-8");
-		const json = JSON.parse(raw) as StateFile;
-		return json.last_tag ?? "";
+		await access(filePath, fsConstants.R_OK);
+		const raw = await readFile(filePath, "utf-8");
+		const json = JSON.parse(raw);
+		if (json && typeof json === "object" && !Array.isArray(json)) {
+			return Object.fromEntries(
+				Object.entries(json).filter(([, value]) => typeof value === "string"),
+			) as StateStore;
+		}
 	} catch {
-		return "";
+		// ignore
 	}
-}
+	return {};
+};
 
-async function writeState(statePath: string, tag: string): Promise<void> {
-	const data: StateFile = { last_tag: tag };
-	await writeFile(statePath, JSON.stringify(data, null, 2), "utf-8");
-}
+const writeStateStore = async (
+	filePath: string,
+	state: StateStore,
+): Promise<void> => {
+	await writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
+};
 
-async function fetchCandidateEntries(
+const fetchCandidateEntries = async (
 	repo: string,
 	token: string,
-): Promise<ReleaseEntry[]> {
+): Promise<ReleaseEntry[]> => {
 	const headers: Record<string, string> = {
 		Accept: "application/vnd.github+json",
 		"User-Agent": "release-monitor-script",
@@ -274,12 +298,12 @@ async function fetchCandidateEntries(
 	}
 
 	return entries;
-}
+};
 
-async function githubJson(
+const githubJson = async (
 	url: string,
 	headers: Record<string, string>,
-): Promise<any> {
+): Promise<any> => {
 	const res = await fetch(url, { headers });
 	if (!res.ok) {
 		const body = await res.text();
@@ -288,12 +312,12 @@ async function githubJson(
 		);
 	}
 	return res.json();
-}
+};
 
-function selectNewEntries(
+const selectNewEntries = (
 	entries: ReleaseEntry[],
 	lastTag: string,
-): ReleaseEntry[] {
+): ReleaseEntry[] => {
 	if (!lastTag) return [...entries].reverse();
 	const result: ReleaseEntry[] = [];
 	for (const entry of entries) {
@@ -301,12 +325,12 @@ function selectNewEntries(
 		result.push(entry);
 	}
 	return result.reverse();
-}
+};
 
-async function resolveContent(
+const resolveContent = async (
 	repo: string,
 	entry: ReleaseEntry,
-): Promise<{ content: string; source: string }> {
+): Promise<{ content: string; source: string }> => {
 	let content = entry.body?.trim() ?? "";
 	let source = content ? "release" : "";
 
@@ -331,12 +355,12 @@ async function resolveContent(
 
 	if (!content) source = "none";
 	return { content, source };
-}
+};
 
-async function tryFetchChangelog(
+const tryFetchChangelog = async (
 	repo: string,
 	entry: ReleaseEntry,
-): Promise<{ text: string; source: string } | null> {
+): Promise<{ text: string; source: string } | null> => {
 	const token = CONFIG.githubToken;
 	const headers: Record<string, string> = {
 		Accept: "application/vnd.github.raw",
@@ -378,9 +402,9 @@ async function tryFetchChangelog(
 		}
 	}
 	return null;
-}
+};
 
-function buildRefCandidates(entry: ReleaseEntry): string[] {
+const buildRefCandidates = (entry: ReleaseEntry): string[] => {
 	const candidates = new Set<string>();
 	const tag = entry.tag;
 	if (tag) {
@@ -394,9 +418,9 @@ function buildRefCandidates(entry: ReleaseEntry): string[] {
 	if (entry.default_branch) candidates.add(entry.default_branch);
 	if (!candidates.size) candidates.add("main");
 	return [...candidates];
-}
+};
 
-function extractChangelogSection(text: string, tag: string): string | null {
+const extractChangelogSection = (text: string, tag: string): string | null => {
 	const lines = text.split(/\r?\n/);
 	const tagVariants = [
 		tag,
@@ -431,11 +455,11 @@ function extractChangelogSection(text: string, tag: string): string | null {
 
 	const section = body.join("\n").trim();
 	return section ? maybeTruncate(section) : null;
-}
+};
 
-async function tryFetchNpm(
+const tryFetchNpm = async (
 	entry: ReleaseEntry,
-): Promise<{ text: string; source: string } | null> {
+): Promise<{ text: string; source: string } | null> => {
 	const tag = entry.tag;
 	if (!tag) return null;
 
@@ -484,17 +508,17 @@ async function tryFetchNpm(
 		);
 		return null;
 	}
-}
+};
 
-function maybeTruncate(text: string, limit = 4000): string {
+const maybeTruncate = (text: string, limit = 4000): string => {
 	if (text.length <= limit) return text;
 	return `${text.slice(0, limit).trimEnd()}\n...`;
-}
+};
 
-async function translateIfNeeded(
+const translateIfNeeded = async (
 	entry: ReleaseEntry,
 	content: string,
-): Promise<string> {
+): Promise<string> => {
 	if (!CONFIG.geminiApiKey) return content;
 	if (!content.trim()) return "";
 
@@ -547,16 +571,16 @@ async function translateIfNeeded(
 		);
 		return content;
 	}
-}
+};
 
-function buildMattermostPayload(
+const buildMattermostPayload = (
 	repo: string,
 	payload: {
 		entry: ReleaseEntry;
 		translated: string;
 		source: string;
 	},
-): string {
+): string => {
 	const { entry, translated, source } = payload;
 	const lines: string[] = [
 		`Release \`${entry.tag}\` detected for *${repo}*`,
@@ -575,17 +599,17 @@ function buildMattermostPayload(
 	lines.push("```");
 
 	return JSON.stringify({ text: lines.join("\n") });
-}
+};
 
-function describeSource(source: string): string | null {
+const describeSource = (source: string): string | null => {
 	if (!source || source === "none") return null;
 	if (source === "release") return "GitHub Release";
 	if (source.startsWith("changelog:")) return source.replace(/^changelog:/, "");
 	if (source.startsWith("npm:")) return source.replace(/^npm:/, "npm ");
 	return source;
-}
+};
 
-async function postMattermost(payloadJson: string): Promise<void> {
+const postMattermost = async (payloadJson: string): Promise<void> => {
 	const res = await fetch(CONFIG.mattermostWebhook, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -597,7 +621,7 @@ async function postMattermost(payloadJson: string): Promise<void> {
 			`Mattermost webhook failed: ${res.status} ${res.statusText} ${body}`,
 		);
 	}
-}
+};
 
 main().catch((error) => {
 	console.error("Fatal:", error);

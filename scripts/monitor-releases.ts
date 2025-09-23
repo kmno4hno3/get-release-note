@@ -35,7 +35,7 @@ type StateStore = Record<string, string>;
 const CONFIG = {
 	repositories: parseList(process.env.TARGET_REPOSITORIES),
 	geminiApiKey: process.env.GEMINI_API_KEY ?? "",
-	geminiModel: process.env.GEMINI_MODEL ?? "gemini-1.5-flash",
+	geminiModel: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
 	mattermostWebhook: process.env.MATTERMOST_WEBHOOK_URL ?? "",
 	npmPackageOverride: process.env.NPM_PACKAGE ?? "",
 	stateDir: process.env.STATE_DIR ?? path.resolve("release-monitor-state"),
@@ -103,8 +103,8 @@ const processRepository = async (
 	const prepared: PreparedPayload[] = [];
 	for (const entry of newEntries) {
 		const { content, source } = await resolveContent(repo, entry);
-		// const translated = await translateIfNeeded(entry, content);
-		// prepared.push({ entry, content, translated, source });
+		const translated = await translateIfNeeded(entry, content);
+		prepared.push({ entry, content, translated, source });
 	}
 
 	for (const payload of prepared) {
@@ -518,9 +518,15 @@ const translateIfNeeded = async (
 			// Gemini API用の設定
 			vertexai: false,
 		});
-		const modelId = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 		const result = await genAI.models.generateContent({
-			model: modelId,
+			model: CONFIG.geminiModel,
+			config: {
+				temperature: 0.8, // 高めの温度で創造性を向上
+				topK: 40, // より多くの候補から選択
+				topP: 0.9, // 多様性を確保
+				candidateCount: 1, // 候補数
+				maxOutputTokens: 1024, // 出力トークン数制限
+			},
 			contents: [
 				{
 					role: "user",

@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+
+# REPO_DIR="/path/to/get-release-note"
+# export PATH="/path/to/node/[version]/bin:$PATH"
+
+cd "$REPO_DIR"
+./node_modules/.bin/ts-node scripts/monitor-releases.ts "$@"

@@ -94,10 +94,24 @@ const processRepository = async (
 		return false;
 	}
 
-	const newEntries = selectNewEntries(entries, lastTag);
+	let newEntries = selectNewEntries(entries, lastTag);
 	if (newEntries.length === 0) {
 		console.log(`[${repo}] No updates since ${lastTag || "N/A"}.`);
 		return false;
+	}
+
+	await assignNpmVersionsToEntries(repo, newEntries, lastTag);
+
+	const seenVersions = new Set<string>();
+	const filteredVersionEntries = newEntries.filter((entry) => {
+		const normalized = normalizeVersion(entry.version);
+		if (!normalized) return false;
+		if (seenVersions.has(normalized)) return false;
+		seenVersions.add(normalized);
+		return true;
+	});
+	if (filteredVersionEntries.length > 0) {
+		newEntries = filteredVersionEntries;
 	}
 
 	console.log(`[${repo}] ${newEntries.length} new release entries detected.`);
@@ -120,8 +134,14 @@ const processRepository = async (
 		await postMattermost(body);
 	}
 
-	const newestEntry = entries[0];
-	const newestValue = newestEntry?.version ?? newestEntry?.tag ?? lastTag;
+	const lastProcessedEntry =
+		prepared[prepared.length - 1]?.entry ??
+		newEntries[newEntries.length - 1] ??
+		entries[0];
+	const newestValue =
+		lastProcessedEntry?.version ??
+		lastProcessedEntry?.tag ??
+		lastTag;
 	let stateUpdated = false;
 
 	if (newestValue) {
@@ -442,6 +462,108 @@ const fetchNpmRegistryInfo = async (
 	}
 };
 
+const fetchNpmVersionTimeline = async (
+	packageName: string,
+): Promise<Array<{ raw: string; normalized: string; timestamp: number }>> => {
+	try {
+		const { stdout } = await execFileAsync(
+			"npm",
+			["view", packageName, "time", "--json"],
+			{
+				maxBuffer: 5 * 1024 * 1024,
+			},
+		);
+		if (!stdout || !stdout.trim()) return [];
+		const data = JSON.parse(stdout);
+		if (!data || typeof data !== "object") return [];
+		const entries: Array<{ raw: string; normalized: string; timestamp: number }> = [];
+		for (const [version, value] of Object.entries(data as Record<string, unknown>)) {
+			if (version === "created" || version === "modified") continue;
+			if (typeof value !== "string") continue;
+			const date = Date.parse(value);
+			if (!Number.isFinite(date)) continue;
+			const normalized =
+				normalizeVersion(version) ?? version.trim().toLowerCase();
+			if (!normalized) continue;
+			entries.push({
+				raw: version.trim(),
+				normalized,
+				timestamp: date,
+			});
+		}
+		return entries.sort((a, b) => a.timestamp - b.timestamp);
+	} catch (error) {
+		console.warn(`[npm] time ${packageName} failed:`, (error as Error).message);
+		return [];
+	}
+};
+
+const assignNpmVersionsToEntries = async (
+	repo: string,
+	entries: ReleaseEntry[],
+	lastRecorded: string,
+): Promise<void> => {
+	const unresolved = entries.filter((entry) => !normalizeVersion(entry.version));
+	if (unresolved.length === 0) return;
+
+	const packageName = resolveNpmPackageName(repo);
+	if (!packageName) return;
+
+	const timeline = await fetchNpmVersionTimeline(packageName);
+	if (timeline.length === 0) return;
+
+	const lastVersion = normalizeVersion(lastRecorded);
+	const usedVersions = new Set<string>();
+	for (const entry of entries) {
+		const normalized =
+			normalizeVersion(entry.version) ?? entry.version?.trim().toLowerCase();
+		if (normalized) usedVersions.add(normalized);
+	}
+
+	let candidateList = timeline;
+	if (lastVersion) {
+		const lastIndex = timeline.findIndex((item) => item.normalized === lastVersion);
+		if (lastIndex >= 0) {
+			candidateList = timeline.slice(lastIndex + 1);
+		}
+	}
+
+	if (candidateList.length === 0) return;
+
+	const filtered = candidateList.filter(
+		(item) => !usedVersions.has(item.normalized),
+	);
+	if (filtered.length === 0) return;
+
+	const needed = unresolved.length;
+	const assignableCount = Math.min(filtered.length, needed);
+	if (assignableCount === 0) return;
+
+	const selected = filtered.slice(-assignableCount);
+	const startIndex = unresolved.length - assignableCount;
+	for (let i = 0; i < assignableCount; i += 1) {
+		const entry = unresolved[startIndex + i];
+		const info = selected[i];
+		entry.version = info.raw;
+		if (entry.tag.startsWith("changelog-")) {
+			entry.tag = info.raw;
+		}
+		if (!entry.npm_package && packageName) {
+			entry.npm_package = packageName;
+		}
+		entry.name = entry.npm_package
+			? `${entry.npm_package}@${info.raw}`
+			: info.raw;
+		if (entry.npm_package) {
+			entry.url = `https://www.npmjs.com/package/${entry.npm_package}/v/${info.raw}`;
+		}
+		entry.reference_kind = "npm";
+		entry.fallback_path = entry.fallback_path ?? "CHANGELOG.md";
+		entry.has_body = entry.has_body && Boolean(entry.body?.trim());
+		usedVersions.add(info.normalized);
+	}
+};
+
 const githubJson = async (
 	url: string,
 	headers: Record<string, string>,
@@ -509,8 +631,8 @@ const resolveContent = async (
 			if (npmResult) {
 				content = npmResult.text;
 				source = npmResult.source;
-				if (npmResult.version) {
-					entry.version = entry.version ?? npmResult.version;
+				if (!entry.version && npmResult.version) {
+					entry.version = npmResult.version;
 				}
 			}
 		}

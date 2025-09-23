@@ -33,15 +33,13 @@ type PreparedPayload = {
 type StateStore = Record<string, string>;
 
 const CONFIG = {
-	repositories: parseList(process.env.TARGET_REPOSITORIES).concat(
-		parseList(process.env.TARGET_REPOSITORY),
-	),
-	githubToken: process.env.GITHUB_TOKEN ?? "",
+	repositories: parseList(process.env.TARGET_REPOSITORIES),
 	geminiApiKey: process.env.GEMINI_API_KEY ?? "",
 	geminiModel: process.env.GEMINI_MODEL ?? "gemini-1.5-flash",
 	mattermostWebhook: process.env.MATTERMOST_WEBHOOK_URL ?? "",
 	npmPackageOverride: process.env.NPM_PACKAGE ?? "",
 	stateDir: process.env.STATE_DIR ?? path.resolve("release-monitor-state"),
+	githubToken: process.env.GITHUB_TOKEN,
 };
 
 const STATE_FILE_PATH = path.join(CONFIG.stateDir, "state.json");
@@ -61,12 +59,9 @@ const main = async (): Promise<void> => {
 	}
 	const repos = dedupe(CONFIG.repositories);
 	if (repos.length === 0) {
-		throw new Error(
-			"TARGET_REPOSITORIES または TARGET_REPOSITORY が未設定です。",
-		);
+		throw new Error("TARGET_REPOSITORIES が未設定です。");
 	}
 
-	// await mkdir(CONFIG.stateDir, { recursive: true });
 	const state = await readStateStore(STATE_FILE_PATH);
 
 	for (const repo of repos) {
@@ -91,7 +86,7 @@ const processRepository = async (
 	const slug = slugify(repo);
 	const lastTag = state[slug] ?? "";
 
-	const entries = await fetchCandidateEntries(repo, CONFIG.githubToken);
+	const entries = await fetchCandidateEntries(repo);
 	if (entries.length === 0) {
 		console.log(`[${repo}] No releases/tags found.`);
 		return false;
@@ -173,15 +168,12 @@ const writeStateStore = async (
 	await writeFile(filePath, JSON.stringify(state, null, 2), "utf-8");
 };
 
-const fetchCandidateEntries = async (
-	repo: string,
-	token: string,
-): Promise<ReleaseEntry[]> => {
+const fetchCandidateEntries = async (repo: string): Promise<ReleaseEntry[]> => {
 	const headers: Record<string, string> = {
 		Accept: "application/vnd.github+json",
 		"User-Agent": "release-monitor-script",
+		Authorization: `Bearer${CONFIG.githubToken}`,
 	};
-	if (token) headers.Authorization = `Bearer ${token}`;
 
 	const repoInfo = await githubJson(
 		`https://api.github.com/repos/${repo}`,
@@ -361,12 +353,10 @@ const tryFetchChangelog = async (
 	repo: string,
 	entry: ReleaseEntry,
 ): Promise<{ text: string; source: string } | null> => {
-	const token = CONFIG.githubToken;
 	const headers: Record<string, string> = {
 		Accept: "application/vnd.github.raw",
 		"User-Agent": "release-monitor-script",
 	};
-	if (token) headers.Authorization = `Bearer ${token}`;
 
 	const paths = entry.fallback_path
 		? [

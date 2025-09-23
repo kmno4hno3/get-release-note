@@ -14,13 +14,15 @@ type ReleaseEntry = {
 	name: string;
 	url: string;
 	body: string;
-	reference_kind: "release" | "tag" | "changelog";
+	reference_kind: "release" | "tag" | "changelog" | "npm";
 	reference_sha?: string;
 	default_branch?: string;
 	fallback_branch?: string;
 	fallback_path?: string;
 	published_at?: string;
 	has_body: boolean;
+	version?: string;
+	npm_package?: string;
 };
 
 type PreparedPayload = {
@@ -38,11 +40,11 @@ const CONFIG = {
 	geminiModel: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
 	mattermostWebhook: process.env.MATTERMOST_WEBHOOK_URL ?? "",
 	npmPackageOverride: process.env.NPM_PACKAGE ?? "",
-	stateDir: process.env.STATE_DIR ?? path.resolve("release-monitor-state"),
+	npmPackageMap: parseMap(process.env.NPM_PACKAGE_MAP),
 	githubToken: process.env.GITHUB_TOKEN,
 };
 
-const STATE_FILE_PATH = path.join(CONFIG.stateDir, "state.json");
+const STATE_FILE_PATH = path.resolve("state.json");
 
 const CHANGELOG_PATHS = [
 	"CHANGELOG.md",
@@ -101,10 +103,16 @@ const processRepository = async (
 	console.log(`[${repo}] ${newEntries.length} new release entries detected.`);
 
 	const prepared: PreparedPayload[] = [];
+	let previousProcessedTag = lastTag;
 	for (const entry of newEntries) {
-		const { content, source } = await resolveContent(repo, entry);
+		const { content, source } = await resolveContent(
+			repo,
+			entry,
+			previousProcessedTag,
+		);
 		const translated = await translateIfNeeded(entry, content);
 		prepared.push({ entry, content, translated, source });
+		previousProcessedTag = entry.tag;
 	}
 
 	for (const payload of prepared) {
@@ -112,17 +120,21 @@ const processRepository = async (
 		await postMattermost(body);
 	}
 
-	const newestTag = entries[0]?.tag ?? lastTag;
+	const newestEntry = entries[0];
+	const newestValue = newestEntry?.version ?? newestEntry?.tag ?? lastTag;
 	let stateUpdated = false;
-	if (newestTag) {
-		stateUpdated = newestTag !== lastTag;
-		state[slug] = newestTag;
+
+	if (newestValue) {
+		stateUpdated = newestValue !== lastTag;
+		state[slug] = newestValue;
 	} else if (lastTag) {
 		delete state[slug];
 		stateUpdated = true;
 	}
 
-	console.log(`[${repo}] State updated: last_tag=${newestTag || ""}`);
+	console.log(
+		`[${repo}] State updated: last_record=${newestValue || ""}`,
+	);
 	return stateUpdated;
 };
 
@@ -134,6 +146,41 @@ function parseList(raw?: string): string[] {
 		.filter(Boolean);
 }
 
+function parseMap(raw?: string): Record<string, string> {
+	if (!raw) return {};
+	const trimmed = raw.trim();
+	if (!trimmed) return {};
+	if (trimmed.startsWith("{")) {
+		try {
+			const parsed = JSON.parse(trimmed);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				const map: Record<string, string> = {};
+				for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+					if (typeof value !== "string") continue;
+					const repoKey = key.trim().toLowerCase();
+					if (!repoKey) continue;
+					map[repoKey] = value.trim();
+				}
+				return map;
+			}
+		} catch (error) {
+			console.warn("Failed to parse NPM_PACKAGE_MAP JSON:", (error as Error).message);
+		}
+	}
+
+	const map: Record<string, string> = {};
+	for (const token of trimmed.split(/[\n,]+/)) {
+		const item = token.trim();
+		if (!item) continue;
+		const [repo, pkg] = item.split("=");
+		if (!repo || !pkg) continue;
+		const repoKey = repo.trim().toLowerCase();
+		if (!repoKey) continue;
+		map[repoKey] = pkg.trim();
+	}
+	return map;
+}
+
 const dedupe = (list: string[]): string[] => {
 	return [...new Set(list.map((s) => s.toLowerCase()))];
 };
@@ -143,6 +190,39 @@ const slugify = (repo: string): string => {
 		.replace(/[^0-9a-z_.-]+/gi, "-")
 		.replace(/^-+|-+$/g, "")
 		.toLowerCase();
+};
+
+const resolveNpmPackageName = (repo: string): string | null => {
+	if (CONFIG.npmPackageOverride?.trim()) {
+		return CONFIG.npmPackageOverride.trim();
+	}
+	const mapped = CONFIG.npmPackageMap[repo.toLowerCase()]?.trim();
+	if (mapped) return mapped;
+	return null;
+};
+
+const extractSemver = (value?: string | null): string | undefined => {
+	if (!value) return undefined;
+	const match = String(value).match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/);
+	return match ? match[0] : undefined;
+};
+
+const normalizeVersion = (value?: string | null): string | null => {
+	const version = extractSemver(value);
+	return version ? version.toLowerCase() : null;
+};
+
+const buildGithubHeaders = (
+	accept = "application/vnd.github+json",
+): Record<string, string> => {
+	const headers: Record<string, string> = {
+		Accept: accept,
+		"User-Agent": "release-monitor-script",
+	};
+	if (CONFIG.githubToken) {
+		headers.Authorization = `Bearer ${CONFIG.githubToken}`;
+	}
+	return headers;
 };
 
 const readStateStore = async (filePath: string): Promise<StateStore> => {
@@ -169,11 +249,7 @@ const writeStateStore = async (
 };
 
 const fetchCandidateEntries = async (repo: string): Promise<ReleaseEntry[]> => {
-	const headers: Record<string, string> = {
-		Accept: "application/vnd.github+json",
-		"User-Agent": "release-monitor-script",
-		Authorization: `Bearer${CONFIG.githubToken}`,
-	};
+	const headers = buildGithubHeaders();
 
 	const repoInfo = await githubJson(
 		`https://api.github.com/repos/${repo}`,
@@ -183,6 +259,7 @@ const fetchCandidateEntries = async (repo: string): Promise<ReleaseEntry[]> => {
 		(repoInfo.default_branch as string | undefined)?.trim() ?? "";
 
 	const entries: ReleaseEntry[] = [];
+	let hasRelease = false;
 
 	try {
 		const releases = await githubJson(
@@ -193,6 +270,7 @@ const fetchCandidateEntries = async (repo: string): Promise<ReleaseEntry[]> => {
 			for (const release of releases) {
 				const tag = (release.tag_name as string | undefined)?.trim();
 				if (!tag) continue;
+				hasRelease = true;
 				entries.push({
 					tag,
 					name: (release.name as string | undefined)?.trim() || tag,
@@ -211,6 +289,7 @@ const fetchCandidateEntries = async (repo: string): Promise<ReleaseEntry[]> => {
 					fallback_path: "",
 					published_at: release.published_at,
 					has_body: Boolean((release.body as string | undefined)?.trim()),
+					version: extractSemver(tag),
 				});
 			}
 		}
@@ -244,6 +323,7 @@ const fetchCandidateEntries = async (repo: string): Promise<ReleaseEntry[]> => {
 						fallback_path: "",
 						published_at: "",
 						has_body: false,
+						version: extractSemver(tagName),
 					});
 				}
 			}
@@ -289,7 +369,77 @@ const fetchCandidateEntries = async (repo: string): Promise<ReleaseEntry[]> => {
 		}
 	}
 
+	if (!hasRelease) {
+		const npmEntry = await fetchNpmRegistryEntry(repo, defaultBranch);
+		if (npmEntry) {
+			const duplicate = entries.some((entry) => {
+				if (entry.tag === npmEntry.tag) return true;
+				if (!entry.version || !npmEntry.version) return false;
+				return entry.version === npmEntry.version;
+			});
+			if (!duplicate) {
+				entries.unshift(npmEntry);
+			}
+		}
+	}
+
 	return entries;
+};
+
+const fetchNpmRegistryEntry = async (
+	repo: string,
+	defaultBranch: string,
+): Promise<ReleaseEntry | null> => {
+	const packageName = resolveNpmPackageName(repo);
+	if (!packageName) return null;
+
+	const info = await fetchNpmRegistryInfo(packageName);
+	if (!info) return null;
+
+	const tag = `npm:${packageName}@${info.version}`;
+	return {
+		tag,
+		name: `${packageName}@${info.version}`,
+		url: `https://www.npmjs.com/package/${packageName}/v/${info.version}`,
+		body: "",
+		reference_kind: "npm",
+		reference_sha: undefined,
+		default_branch: defaultBranch,
+		fallback_branch: defaultBranch,
+		fallback_path: "CHANGELOG.md",
+		published_at: info.publishedAt ?? "",
+		has_body: false,
+		version: info.version,
+		npm_package: packageName,
+	};
+};
+
+const fetchNpmRegistryInfo = async (
+	packageName: string,
+): Promise<{ version: string; publishedAt?: string } | null> => {
+	try {
+		const { stdout } = await execFileAsync(
+			"npm",
+			["view", packageName, "--json"],
+			{
+				maxBuffer: 5 * 1024 * 1024,
+			},
+		);
+		if (!stdout || !stdout.trim()) return null;
+		const data = JSON.parse(stdout);
+		const info = Array.isArray(data) ? data[0] : data;
+		const version =
+			extractSemver(info?.version) ?? String(info?.version ?? "").trim();
+		if (!version) return null;
+		const publishedAt =
+			info?.time && typeof info.time === "object"
+				? (info.time[version] as string | undefined)
+				: undefined;
+		return { version, publishedAt };
+	} catch (error) {
+		console.warn(`[npm] view ${packageName} failed:`, (error as Error).message);
+		return null;
+	}
 };
 
 const githubJson = async (
@@ -306,6 +456,19 @@ const githubJson = async (
 	return res.json();
 };
 
+const isSameRelease = (entry: ReleaseEntry, storedTag: string): boolean => {
+	if (!storedTag) return false;
+	if (entry.tag === storedTag) return true;
+	const storedVersion = normalizeVersion(storedTag);
+	if (!storedVersion) return false;
+	const candidateVersions = new Set<string>();
+	const entryVersion = normalizeVersion(entry.version);
+	if (entryVersion) candidateVersions.add(entryVersion);
+	const tagVersion = normalizeVersion(entry.tag);
+	if (tagVersion) candidateVersions.add(tagVersion);
+	return candidateVersions.has(storedVersion);
+};
+
 const selectNewEntries = (
 	entries: ReleaseEntry[],
 	lastTag: string,
@@ -313,7 +476,7 @@ const selectNewEntries = (
 	if (!lastTag) return [...entries].reverse();
 	const result: ReleaseEntry[] = [];
 	for (const entry of entries) {
-		if (entry.tag === lastTag) break;
+		if (isSameRelease(entry, lastTag)) break;
 		result.push(entry);
 	}
 	return result.reverse();
@@ -322,26 +485,34 @@ const selectNewEntries = (
 const resolveContent = async (
 	repo: string,
 	entry: ReleaseEntry,
+	previousTag: string,
 ): Promise<{ content: string; source: string }> => {
 	let content = entry.body?.trim() ?? "";
-	let source = content ? "release" : "";
+	let source = content ? entry.reference_kind : "";
 
-	const needsFallback =
-		entry.reference_kind === "release" ? !entry.has_body : !content;
+	if (entry.reference_kind === "release") {
+		return {
+			content,
+			source: content ? "release" : "none",
+		};
+	}
+
+	const needsFallback = !content;
 
 	if (needsFallback) {
 		const changelog = await tryFetchChangelog(repo, entry);
 		if (changelog) {
 			content = changelog.text;
 			source = changelog.source;
-		}
-	}
-
-	if (!content) {
-		const npmText = await tryFetchNpm(entry);
-		if (npmText) {
-			content = npmText.text;
-			source = npmText.source;
+		} else {
+			const npmResult = await tryResolveViaNpm(repo, entry, previousTag);
+			if (npmResult) {
+				content = npmResult.text;
+				source = npmResult.source;
+				if (npmResult.version) {
+					entry.version = entry.version ?? npmResult.version;
+				}
+			}
 		}
 	}
 
@@ -353,10 +524,7 @@ const tryFetchChangelog = async (
 	repo: string,
 	entry: ReleaseEntry,
 ): Promise<{ text: string; source: string } | null> => {
-	const headers: Record<string, string> = {
-		Accept: "application/vnd.github.raw",
-		"User-Agent": "release-monitor-script",
-	};
+	const headers = buildGithubHeaders("application/vnd.github.raw");
 
 	const paths = entry.fallback_path
 		? [
@@ -376,12 +544,9 @@ const tryFetchChangelog = async (
 				if (res.status === 404) continue;
 				if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 				const text = await res.text();
-				const section = extractChangelogSection(text, entry.tag);
+				const section = extractChangelogSection(text, entry.tag, entry.version);
 				if (section) {
 					return { text: section, source: `changelog:${filePath}` };
-				}
-				if (text.trim()) {
-					return { text: maybeTruncate(text), source: `changelog:${filePath}` };
 				}
 			} catch (error) {
 				console.warn(
@@ -394,6 +559,50 @@ const tryFetchChangelog = async (
 	return null;
 };
 
+const tryResolveViaNpm = async (
+	repo: string,
+	entry: ReleaseEntry,
+	previousTag: string,
+): Promise<{ text: string; source: string; version?: string } | null> => {
+	const packageName = entry.npm_package ?? resolveNpmPackageName(repo);
+	if (!packageName) return null;
+
+	let version = entry.version;
+	if (!version) {
+		const info = await fetchNpmRegistryInfo(packageName);
+		version = info?.version;
+	}
+	if (!version) return null;
+
+	const augmentedEntry: ReleaseEntry = {
+		...entry,
+		version,
+	};
+
+	if (entry.version !== version) {
+		const changelog = await tryFetchChangelog(repo, augmentedEntry);
+		if (changelog) {
+			return { ...changelog, version };
+		}
+	}
+
+	const pseudo = await buildPseudoReleaseNotes(
+		repo,
+		previousTag,
+		augmentedEntry,
+		version,
+	);
+	if (pseudo) {
+		return { ...pseudo, version };
+	}
+
+	return {
+		text: `CHANGELOG.md に記載なし (${version})`,
+		source: "changelog:none",
+		version,
+	};
+};
+
 const buildRefCandidates = (entry: ReleaseEntry): string[] => {
 	const candidates = new Set<string>();
 	const tag = entry.tag;
@@ -403,6 +612,15 @@ const buildRefCandidates = (entry: ReleaseEntry): string[] => {
 			candidates.add(tag.replace("refs/tags/", ""));
 		if (tag.startsWith("v")) candidates.add(tag.slice(1));
 	}
+
+	const version = entry.version;
+	if (version) {
+		candidates.add(version);
+		if (!version.startsWith("v")) {
+			candidates.add(`v${version}`);
+		}
+	}
+
 	if (entry.reference_sha) candidates.add(entry.reference_sha);
 	if (entry.fallback_branch) candidates.add(entry.fallback_branch);
 	if (entry.default_branch) candidates.add(entry.default_branch);
@@ -410,15 +628,173 @@ const buildRefCandidates = (entry: ReleaseEntry): string[] => {
 	return [...candidates];
 };
 
-const extractChangelogSection = (text: string, tag: string): string | null => {
+const buildPseudoReleaseNotes = async (
+	repo: string,
+	previousTag: string,
+	entry: ReleaseEntry,
+	version: string,
+): Promise<{ text: string; source: string } | null> => {
+	const headers = buildGithubHeaders();
+	const currentRefs = buildRefCandidates(entry).filter(Boolean);
+	const previousRefs = previousTag
+		? buildRefCandidates({
+				...entry,
+				tag: previousTag,
+				version: extractSemver(previousTag),
+			})
+		: [];
+
+	let compareResult: any = null;
+	if (currentRefs.length && previousRefs.length) {
+		compareResult = await fetchFirstSuccessfulCompare(
+			repo,
+			previousRefs,
+			currentRefs,
+			headers,
+		);
+	}
+
+	const lines: string[] = [`CHANGELOG.md に記載なし (${version})`];
+
+	if (compareResult && Array.isArray(compareResult.commits)) {
+		const commits = compareResult.commits as Array<{
+			sha?: string;
+			commit?: { message?: string };
+		}>;
+		if (commits.length) {
+			lines.push("");
+			for (const commit of commits.slice(-10)) {
+				const sha = (commit.sha ?? "").slice(0, 7);
+				const summary = String(commit.commit?.message ?? "")
+					.split(/\r?\n/)[0]
+					.trim();
+				const bullet = sha ? `- ${sha} ${summary}` : `- ${summary}`;
+				lines.push(bullet.trim());
+			}
+			const baseSha =
+				compareResult.base_commit?.sha?.slice(0, 7) ||
+				previousRefs[0] ||
+				"unknown";
+			const latestCommit = commits[commits.length - 1];
+			const headSha =
+				latestCommit?.sha?.slice(0, 7) || currentRefs[0] || "unknown";
+			return {
+				text: maybeTruncate(lines.join("\n")),
+				source: `diff:${baseSha}...${headSha}`,
+			};
+		}
+	}
+
+	const fallbackCommits = await fetchRecentCommits(
+		repo,
+		entry.default_branch,
+		headers,
+	);
+	if (fallbackCommits.length) {
+		lines.push("");
+		for (const commit of fallbackCommits) {
+			const bullet = commit.sha
+				? `- ${commit.sha} ${commit.message}`
+				: `- ${commit.message}`;
+			lines.push(bullet.trim());
+		}
+		return {
+			text: maybeTruncate(lines.join("\n")),
+			source: `commit-log:${entry.default_branch ?? "main"}`,
+		};
+	}
+
+	return {
+		text: lines.join("\n"),
+		source: "changelog:none",
+	};
+};
+
+const fetchFirstSuccessfulCompare = async (
+	repo: string,
+	previousRefs: string[],
+	currentRefs: string[],
+	headers: Record<string, string>,
+): Promise<any | null> => {
+	for (const previousRef of previousRefs) {
+		for (const currentRef of currentRefs) {
+			const url = `https://api.github.com/repos/${repo}/compare/${encodeURIComponent(
+				previousRef,
+			)}...${encodeURIComponent(currentRef)}`;
+			try {
+				return await githubJson(url, headers);
+			} catch (error) {
+				const message = (error as Error).message;
+				if (message.includes("404")) {
+					continue;
+				}
+				console.warn(
+					`[${repo}] compare ${previousRef}...${currentRef} failed:`,
+					message,
+				);
+			}
+		}
+	}
+	return null;
+};
+
+const fetchRecentCommits = async (
+	repo: string,
+	branch?: string,
+	headers?: Record<string, string>,
+): Promise<Array<{ sha: string; message: string }>> => {
+	const targetBranch = branch?.trim() || "main";
+	try {
+		const commits = await githubJson(
+			`https://api.github.com/repos/${repo}/commits?sha=${encodeURIComponent(
+				targetBranch,
+			)}&per_page=10`,
+			headers ?? buildGithubHeaders(),
+		);
+		if (!Array.isArray(commits)) return [];
+		return commits.map((commit) => {
+			const sha = String(commit.sha ?? "").slice(0, 7);
+			const message = String(commit.commit?.message ?? "")
+				.split(/\r?\n/)[0]
+				.trim();
+			return { sha, message };
+		});
+	} catch (error) {
+		console.warn(
+			`[${repo}] commit log fetch failed (${targetBranch}):`,
+			(error as Error).message,
+		);
+		return [];
+	}
+};
+
+const extractChangelogSection = (
+	text: string,
+	tag: string,
+	version?: string,
+): string | null => {
 	const lines = text.split(/\r?\n/);
-	const tagVariants = [
-		tag,
-		tag.replace(/^v/, ""),
-		tag.replace(/^refs\/tags\//, ""),
-	]
-		.map((v) => v.toLowerCase())
-		.filter(Boolean);
+	const identifiers = [tag, version].filter(Boolean) as string[];
+	const tagVariants = new Set<string>();
+
+	for (const identifier of identifiers) {
+		const trimmed = identifier.trim();
+		if (!trimmed) continue;
+		const candidates = [
+			trimmed,
+			trimmed.replace(/^v/, ""),
+			trimmed.replace(/^refs\/tags\//, ""),
+		];
+		if (!trimmed.startsWith("v")) {
+			candidates.push(`v${trimmed}`);
+		}
+		for (const candidate of candidates) {
+			const lowered = candidate.toLowerCase();
+			if (lowered) tagVariants.add(lowered);
+		}
+	}
+
+	const variantList = [...tagVariants];
 
 	let capturing = false;
 	const body: string[] = [];
@@ -431,7 +807,10 @@ const extractChangelogSection = (text: string, tag: string): string | null => {
 			const headingText = headingMatch[2]
 				.replace(/\[.*?\]\(.*?\)/g, "")
 				.toLowerCase();
-			if (tagVariants.some((variant) => headingText.includes(variant))) {
+			if (
+				variantList.length > 0 &&
+				variantList.some((variant) => headingText.includes(variant))
+			) {
 				capturing = true;
 				currentLevel = level;
 				continue;
@@ -445,59 +824,6 @@ const extractChangelogSection = (text: string, tag: string): string | null => {
 
 	const section = body.join("\n").trim();
 	return section ? maybeTruncate(section) : null;
-};
-
-const tryFetchNpm = async (
-	entry: ReleaseEntry,
-): Promise<{ text: string; source: string } | null> => {
-	const tag = entry.tag;
-	if (!tag) return null;
-
-	const packageName =
-		CONFIG.npmPackageOverride ||
-		entry.tag.split("/").pop()?.split("@").pop() ||
-		"";
-	if (!packageName) return null;
-
-	let version = tag.replace(/^refs\/tags\//, "");
-	if (version.startsWith("v")) version = version.slice(1);
-
-	try {
-		const { stdout } = await execFileAsync(
-			"npm",
-			["view", `${packageName}@${version}`, "--json"],
-			{
-				maxBuffer: 5 * 1024 * 1024,
-			},
-		);
-		if (!stdout || stdout.trim() === "null" || stdout.trim() === "undefined") {
-			return null;
-		}
-		const data = JSON.parse(stdout);
-		const blocks: string[] = [];
-
-		const description = (Array.isArray(data) ? data[0] : data)?.description;
-		if (description) blocks.push(String(description).trim());
-
-		const releaseNotes = (Array.isArray(data) ? data[0] : data)?.releaseNotes;
-		if (releaseNotes) blocks.push(String(releaseNotes).trim());
-
-		const readme = (Array.isArray(data) ? data[0] : data)?.readme;
-		if (readme) {
-			const section = extractChangelogSection(String(readme), entry.tag);
-			if (section) blocks.push(section);
-		}
-
-		if (blocks.length === 0) return null;
-		const text = maybeTruncate(blocks.join("\n\n"));
-		return { text, source: `npm:${packageName}@${version}` };
-	} catch (error) {
-		console.warn(
-			`[npm] view ${packageName}@${version} failed:`,
-			(error as Error).message,
-		);
-		return null;
-	}
 };
 
 const maybeTruncate = (text: string, limit = 4000): string => {

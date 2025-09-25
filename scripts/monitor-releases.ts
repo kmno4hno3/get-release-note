@@ -42,6 +42,7 @@ const CONFIG = {
 	npmPackageOverride: process.env.NPM_PACKAGE ?? "",
 	npmPackageMap: parseMap(process.env.NPM_PACKAGE_MAP),
 	githubToken: process.env.GITHUB_TOKEN,
+	skipTlsVerification: parseBoolean(process.env.SKIP_TLS_VERIFY),
 };
 
 const STATE_FILE_PATH = path.resolve("state.json");
@@ -54,6 +55,13 @@ const CHANGELOG_PATHS = [
 	"CHANGELOG",
 	"docs/CHANGELOG",
 ];
+
+if (CONFIG.skipTlsVerification) {
+	process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+	console.warn(
+		"TLS証明書の検証をスキップする設定が有効です。通信経路の安全性が低下します。",
+	);
+}
 
 const main = async (): Promise<void> => {
 	if (!CONFIG.mattermostWebhook) {
@@ -139,9 +147,7 @@ const processRepository = async (
 		newEntries[newEntries.length - 1] ??
 		entries[0];
 	const newestValue =
-		lastProcessedEntry?.version ??
-		lastProcessedEntry?.tag ??
-		lastTag;
+		lastProcessedEntry?.version ?? lastProcessedEntry?.tag ?? lastTag;
 	let stateUpdated = false;
 
 	if (newestValue) {
@@ -152,9 +158,7 @@ const processRepository = async (
 		stateUpdated = true;
 	}
 
-	console.log(
-		`[${repo}] State updated: last_record=${newestValue || ""}`,
-	);
+	console.log(`[${repo}] State updated: last_record=${newestValue || ""}`);
 	return stateUpdated;
 };
 
@@ -166,6 +170,13 @@ function parseList(raw?: string): string[] {
 		.filter(Boolean);
 }
 
+function parseBoolean(raw?: string): boolean {
+	if (!raw) return false;
+	const normalized = raw.trim().toLowerCase();
+	if (!normalized) return false;
+	return ["1", "true", "yes", "on"].includes(normalized);
+}
+
 function parseMap(raw?: string): Record<string, string> {
 	if (!raw) return {};
 	const trimmed = raw.trim();
@@ -175,7 +186,9 @@ function parseMap(raw?: string): Record<string, string> {
 			const parsed = JSON.parse(trimmed);
 			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
 				const map: Record<string, string> = {};
-				for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+				for (const [key, value] of Object.entries(
+					parsed as Record<string, unknown>,
+				)) {
 					if (typeof value !== "string") continue;
 					const repoKey = key.trim().toLowerCase();
 					if (!repoKey) continue;
@@ -184,7 +197,10 @@ function parseMap(raw?: string): Record<string, string> {
 				return map;
 			}
 		} catch (error) {
-			console.warn("Failed to parse NPM_PACKAGE_MAP JSON:", (error as Error).message);
+			console.warn(
+				"Failed to parse NPM_PACKAGE_MAP JSON:",
+				(error as Error).message,
+			);
 		}
 	}
 
@@ -476,8 +492,14 @@ const fetchNpmVersionTimeline = async (
 		if (!stdout || !stdout.trim()) return [];
 		const data = JSON.parse(stdout);
 		if (!data || typeof data !== "object") return [];
-		const entries: Array<{ raw: string; normalized: string; timestamp: number }> = [];
-		for (const [version, value] of Object.entries(data as Record<string, unknown>)) {
+		const entries: Array<{
+			raw: string;
+			normalized: string;
+			timestamp: number;
+		}> = [];
+		for (const [version, value] of Object.entries(
+			data as Record<string, unknown>,
+		)) {
 			if (version === "created" || version === "modified") continue;
 			if (typeof value !== "string") continue;
 			const date = Date.parse(value);
@@ -503,7 +525,9 @@ const assignNpmVersionsToEntries = async (
 	entries: ReleaseEntry[],
 	lastRecorded: string,
 ): Promise<void> => {
-	const unresolved = entries.filter((entry) => !normalizeVersion(entry.version));
+	const unresolved = entries.filter(
+		(entry) => !normalizeVersion(entry.version),
+	);
 	if (unresolved.length === 0) return;
 
 	const packageName = resolveNpmPackageName(repo);
@@ -522,7 +546,9 @@ const assignNpmVersionsToEntries = async (
 
 	let candidateList = timeline;
 	if (lastVersion) {
-		const lastIndex = timeline.findIndex((item) => item.normalized === lastVersion);
+		const lastIndex = timeline.findIndex(
+			(item) => item.normalized === lastVersion,
+		);
 		if (lastIndex >= 0) {
 			candidateList = timeline.slice(lastIndex + 1);
 		}
@@ -968,21 +994,14 @@ const translateIfNeeded = async (
 		});
 		const result = await genAI.models.generateContent({
 			model: CONFIG.geminiModel,
-			config: {
-				temperature: 0.8, // 高めの温度で創造性を向上
-				topK: 40, // より多くの候補から選択
-				topP: 0.9, // 多様性を確保
-				candidateCount: 1, // 候補数
-				maxOutputTokens: 1024, // 出力トークン数制限
-			},
 			contents: [
 				{
 					role: "user",
 					parts: [
 						{
 							text: [
-								"次のリリースノートを日本語でまとめ直してください。",
-								"テンプレートに従いMarkdownで出力します。",
+								"入力テキストを日本語でまとめ直してください。",
+								"テンプレートに従いMarkdown形式で出力してください。",
 								"",
 								"リリースノート",
 								"",
